@@ -195,6 +195,7 @@ def _persist_log_entry(entry: dict) -> None:
     fh     = None
     target = 0
 
+    t0 = time.monotonic()
     with _log_cond:
         if _log_fh is None:
             os.makedirs(DATA_DIR, exist_ok=True)
@@ -211,12 +212,24 @@ def _persist_log_entry(entry: dict) -> None:
                 break
             _log_cond.wait()
 
+    t_wrote = time.monotonic()
+
     if fh is None:
+        log.info("persist seq=%d waited_for_group_fsync=%.1fms", my_seq, (t_wrote - t0) * 1000)
         return  # another thread's fsync covered us
 
     try:
         fh.flush()
+        t_flushed = time.monotonic()
         os.fsync(fh.fileno())
+        t_fsynced = time.monotonic()
+        log.info(
+            "persist seq=%d (leader) target=%d flush=%.1fms fsync=%.1fms total=%.1fms",
+            my_seq, target,
+            (t_flushed - t_wrote) * 1000,
+            (t_fsynced - t_flushed) * 1000,
+            (t_fsynced - t0) * 1000,
+        )
     finally:
         with _log_cond:
             _log_synced_seq    = target
@@ -811,18 +824,32 @@ def _leader_write(command: dict) -> None:
     follower acks.  This changes in the log-replication stage."""
     global _commit_index
 
+    t0 = time.monotonic()
+
     # 1. Append to in-memory log (under lock)
     with _raft_lock:
         idx, entry = _log_append_mem(_current_term, command)
+    t1 = time.monotonic()
 
     # 2. Persist the entry (group-commit fsync, lock released)
     _persist_log_entry(entry)
+    t2 = time.monotonic()
 
     # 3. Mark committed and apply to store (under lock)
     with _raft_lock:
         if _commit_index < idx:
             _commit_index = idx
             _apply_committed_entries()
+    t3 = time.monotonic()
+
+    log.info(
+        "leader_write idx=%d lock1=%.1fms persist=%.1fms lock2=%.1fms total=%.1fms",
+        idx,
+        (t1 - t0) * 1000,
+        (t2 - t1) * 1000,
+        (t3 - t2) * 1000,
+        (t3 - t0) * 1000,
+    )
 
 
 @app.route("/kv/", methods=["GET", "PUT", "DELETE"])
@@ -868,6 +895,24 @@ def clear():
 @app.errorhandler(405)
 def method_not_allowed(_):
     return Response("method not allowed\n", status=405)
+
+
+# ---------------------------------------------------------------------------
+# Request timing middleware
+# ---------------------------------------------------------------------------
+
+@app.before_request
+def _before_request():
+    freq.environ["_t_start"] = time.monotonic()
+
+
+@app.after_request
+def _after_request(response):
+    t_start = freq.environ.get("_t_start")
+    if t_start is not None:
+        elapsed_ms = (time.monotonic() - t_start) * 1000
+        log.info("request %s %s -> %d (%.1fms)", freq.method, freq.path, response.status_code, elapsed_ms)
+    return response
 
 
 # ---------------------------------------------------------------------------
