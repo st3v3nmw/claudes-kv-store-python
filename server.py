@@ -931,31 +931,49 @@ _write_queue: _queue_module.SimpleQueue = _queue_module.SimpleQueue()
 
 
 def _write_worker_loop() -> None:
-    """Single-threaded actor: dequeue write commands, execute, signal callers."""
+    """Batch-commit actor: drain queue, append all entries under one lock
+    acquisition, persist together, then wake all callers.
+
+    Amortises _raft_lock overhead and (when WAL is made synchronous) fsync
+    cost across however many requests arrived while the previous batch was
+    in flight — matching the Go reference batch-writer pattern."""
     global _commit_index
     while True:
-        command, done_event, t0 = _write_queue.get()
+        # Block until at least one write is queued.
+        first = _write_queue.get()
+        batch = [first]
+
+        # Drain any additional writes that arrived while we were waiting.
+        while True:
+            try:
+                batch.append(_write_queue.get_nowait())
+            except _queue_module.Empty:
+                break
+
+        t1 = time.monotonic()
+        entries = []
         try:
             with _raft_lock:
-                idx, entry = _log_append_mem(_current_term, command)
-                _commit_index = idx
+                for command, _done, _t0 in batch:
+                    idx, entry = _log_append_mem(_current_term, command)
+                    _commit_index = idx
+                    entries.append(entry)
                 _apply_committed_entries()
 
-            t1 = time.monotonic()
-            _persist_log_entry(entry)   # async WAL, does not block
-            t2 = time.monotonic()
+            for entry in entries:
+                _persist_log_entry(entry)   # async WAL, does not block
 
-            total_ms   = (t2 - t0) * 1000
-            persist_ms = (t2 - t1) * 1000
+            t2 = time.monotonic()
+            batch_ms = (t2 - t1) * 1000
+            n = len(batch)
             _record(
-                write_n=1,
-                write_ms=total_ms,
-                write_max_ms=total_ms,
-                persist_ms=persist_ms,
-                persist_max_ms=persist_ms,
+                write_n=n,
+                write_ms=batch_ms,
+                write_max_ms=batch_ms,
             )
         finally:
-            done_event.set()
+            for _command, done_event, _t0 in batch:
+                done_event.set()
 
 
 threading.Thread(target=_write_worker_loop, daemon=True, name="write-worker").start()
