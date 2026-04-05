@@ -1,8 +1,11 @@
 bind = "0.0.0.0:8080"
 workers = 1
 worker_class = "gthread"
-threads = 256    # enough to avoid TCP backlog overflow under concurrent load
-backlog = 4096   # OS listen queue — prevents SYN drops that cause ~3s client retransmits
+# 32 threads: enough to service the TCP backlog quickly while keeping
+# _raft_lock contention low (OS context-switch overhead grows ~linearly
+# with thread count under a hot mutex on a 2-vCPU CI runner).
+threads = 32
+backlog = 4096
 timeout = 30
 
 # Disable HTTP keep-alive so the server closes connections after each response.

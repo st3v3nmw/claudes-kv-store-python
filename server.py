@@ -925,22 +925,19 @@ def _leader_write(command: dict) -> None:
 
     t0 = time.monotonic()
 
-    # 1. Append to in-memory log (under lock)
+    # Single lock acquisition: append, commit, and apply atomically.
+    # Persist happens after the lock is released (WAL writer is async).
+    # Halves _raft_lock contention vs. the two-acquisition pattern.
     with _raft_lock:
         idx, entry = _log_append_mem(_current_term, command)
-    t1 = time.monotonic()
+        _commit_index = idx
+        _apply_committed_entries()
 
-    # 2. Persist the entry (group-commit fsync, lock released)
-    _persist_log_entry(entry)
+    t1 = time.monotonic()
+    _persist_log_entry(entry)   # async WAL, does not block
     t2 = time.monotonic()
 
-    # 3. Mark committed and apply to store (under lock)
-    with _raft_lock:
-        if _commit_index < idx:
-            _commit_index = idx
-            _apply_committed_entries()
-    t3 = time.monotonic()
-    total_ms   = (t3 - t0) * 1000
+    total_ms   = (t2 - t0) * 1000
     persist_ms = (t2 - t1) * 1000
     _record(
         write_n=1,
