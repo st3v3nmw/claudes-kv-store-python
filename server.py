@@ -49,6 +49,62 @@ log = logging.getLogger("raft")
 app = Flask(__name__)
 
 # ---------------------------------------------------------------------------
+# Perf stats — accumulated across all threads, printed every 2 s
+# ---------------------------------------------------------------------------
+
+_stats_lock = threading.Lock()
+_stats: dict = {
+    # requests
+    "req_n": 0, "req_ms": 0.0, "req_max_ms": 0.0,
+    # leader_write
+    "write_n": 0, "write_ms": 0.0, "write_max_ms": 0.0,
+    "persist_ms": 0.0, "persist_max_ms": 0.0,
+    # fsync (leader only)
+    "fsync_n": 0, "fsync_ms": 0.0, "fsync_max_ms": 0.0,
+    "fsync_batch_total": 0,           # sum of batch sizes
+}
+
+
+def _record(**kw):
+    with _stats_lock:
+        for k, v in kw.items():
+            if k.endswith("_max_ms"):
+                if v > _stats[k]:
+                    _stats[k] = v
+            else:
+                _stats[k] += v
+
+
+def _stats_printer():
+    while True:
+        time.sleep(2)
+        with _stats_lock:
+            s = dict(_stats)
+            for k in _stats:
+                _stats[k] = 0
+
+        if s["req_n"] == 0 and s["write_n"] == 0:
+            continue
+
+        req_avg   = s["req_ms"]     / s["req_n"]   if s["req_n"]   else 0
+        write_avg = s["write_ms"]   / s["write_n"] if s["write_n"] else 0
+        per_avg   = s["persist_ms"] / s["write_n"] if s["write_n"] else 0
+        fsync_avg = s["fsync_ms"]   / s["fsync_n"] if s["fsync_n"] else 0
+        batch_avg = s["fsync_batch_total"] / s["fsync_n"] if s["fsync_n"] else 0
+
+        log.info(
+            "STATS | reqs=%d avg=%.1fms max=%.1fms | "
+            "writes=%d avg=%.1fms max=%.1fms persist_avg=%.1fms persist_max=%.1fms | "
+            "fsyncs=%d avg=%.1fms max=%.1fms batch_avg=%.1f",
+            s["req_n"], req_avg, s["req_max_ms"],
+            s["write_n"], write_avg, s["write_max_ms"], per_avg, s["persist_max_ms"],
+            s["fsync_n"], fsync_avg, s["fsync_max_ms"], batch_avg,
+        )
+
+
+threading.Thread(target=_stats_printer, daemon=True).start()
+
+# ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
 
@@ -166,37 +222,87 @@ def _apply_committed_entries() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Raft log file — append-only with group-commit fsync
+# Raft log file — append-only with WAL-writer group-commit fsync
+#
+# Request threads write a line to the buffer and park on _log_flushed.
+# A single background WAL-writer thread drains the buffer and fsyncs on
+# demand, then wakes all parked threads.  This naturally batches every
+# write that arrived while a previous fsync was in flight.
 #
 # Only log entries are written here; term/vote live in raft_state.json.
 # Truncation (rare, follower conflict) rewrites the whole file.
 # ---------------------------------------------------------------------------
 
-_log_cond:            threading.Condition = threading.Condition()
-_log_fh                                   = None   # open file handle
-_log_write_seq:       int                 = 0
-_log_synced_seq:      int                 = 0
-_log_sync_in_progress: bool              = False
+_log_write_lock: threading.Lock      = threading.Lock()   # serialise file writes
+_log_flushed:    threading.Condition = threading.Condition()
+_log_fh                              = None   # open file handle, guarded by _log_write_lock
+_log_write_seq:  int                 = 0      # incremented under _log_write_lock
+_log_synced_seq: int                 = 0      # updated by WAL writer, read under _log_flushed
+
+_wal_work: threading.Event = threading.Event()   # signals WAL writer that work is pending
 
 
 def _log_path() -> str:
     return os.path.join(DATA_DIR, RAFT_LOG_FILE)
 
 
+_WAL_BATCH_WINDOW = 0.002   # 2 ms — let concurrent writes accumulate before fsync
+
+
+def _wal_writer_loop() -> None:
+    """Daemon: wait for pending writes, fsync the log file, wake parked callers."""
+    global _log_synced_seq
+    while True:
+        _wal_work.wait()           # park until someone signals work
+        _wal_work.clear()
+        time.sleep(_WAL_BATCH_WINDOW)   # batch window: let other writers fill the buffer
+
+        with _log_write_lock:
+            target = _log_write_seq
+            fh     = _log_fh
+            batch_start = _log_synced_seq
+
+        if fh is None or target <= _log_synced_seq:
+            continue
+
+        t0 = time.monotonic()
+        try:
+            fh.flush()
+            t_flushed = time.monotonic()
+            os.fsync(fh.fileno())
+            t_fsynced = time.monotonic()
+            fsync_ms   = (t_fsynced - t_flushed) * 1000
+            batch_size = target - batch_start
+            _record(
+                fsync_n=1,
+                fsync_ms=fsync_ms,
+                fsync_max_ms=fsync_ms,
+                fsync_batch_total=batch_size,
+            )
+        except Exception:
+            log.exception("WAL writer fsync failed")
+            continue
+
+        with _log_flushed:
+            _log_synced_seq = target
+            _log_flushed.notify_all()
+
+
+threading.Thread(target=_wal_writer_loop, daemon=True, name="wal-writer").start()
+
+
 def _persist_log_entry(entry: dict) -> None:
-    """Durably append one log entry. Blocks until fsync covers this entry.
+    """Durably append one log entry. Blocks until the WAL writer fsyncs it.
     Called WITHOUT _raft_lock held."""
-    global _log_fh, _log_write_seq, _log_synced_seq, _log_sync_in_progress
+    global _log_fh, _log_write_seq
 
     if not DATA_DIR:
         return
 
     line = json.dumps(entry, ensure_ascii=False) + "\n"
-    fh     = None
-    target = 0
 
     t0 = time.monotonic()
-    with _log_cond:
+    with _log_write_lock:
         if _log_fh is None:
             os.makedirs(DATA_DIR, exist_ok=True)
             _log_fh = open(_log_path(), "a", encoding="utf-8")
@@ -204,37 +310,11 @@ def _persist_log_entry(entry: dict) -> None:
         _log_write_seq += 1
         my_seq = _log_write_seq
 
+    _wal_work.set()   # wake the WAL writer (idempotent if already set)
+
+    with _log_flushed:
         while _log_synced_seq < my_seq:
-            if not _log_sync_in_progress:
-                _log_sync_in_progress = True
-                target = _log_write_seq
-                fh     = _log_fh
-                break
-            _log_cond.wait()
-
-    t_wrote = time.monotonic()
-
-    if fh is None:
-        log.info("persist seq=%d waited_for_group_fsync=%.1fms", my_seq, (t_wrote - t0) * 1000)
-        return  # another thread's fsync covered us
-
-    try:
-        fh.flush()
-        t_flushed = time.monotonic()
-        os.fsync(fh.fileno())
-        t_fsynced = time.monotonic()
-        log.info(
-            "persist seq=%d (leader) target=%d flush=%.1fms fsync=%.1fms total=%.1fms",
-            my_seq, target,
-            (t_flushed - t_wrote) * 1000,
-            (t_fsynced - t_flushed) * 1000,
-            (t_fsynced - t0) * 1000,
-        )
-    finally:
-        with _log_cond:
-            _log_synced_seq    = target
-            _log_sync_in_progress = False
-            _log_cond.notify_all()
+            _log_flushed.wait()
 
 
 def _rewrite_log_file() -> None:
@@ -245,7 +325,7 @@ def _rewrite_log_file() -> None:
     if not DATA_DIR:
         return
 
-    with _log_cond:
+    with _log_write_lock:
         if _log_fh is not None:
             _log_fh.close()
             _log_fh = None
@@ -841,14 +921,14 @@ def _leader_write(command: dict) -> None:
             _commit_index = idx
             _apply_committed_entries()
     t3 = time.monotonic()
-
-    log.info(
-        "leader_write idx=%d lock1=%.1fms persist=%.1fms lock2=%.1fms total=%.1fms",
-        idx,
-        (t1 - t0) * 1000,
-        (t2 - t1) * 1000,
-        (t3 - t2) * 1000,
-        (t3 - t0) * 1000,
+    total_ms   = (t3 - t0) * 1000
+    persist_ms = (t2 - t1) * 1000
+    _record(
+        write_n=1,
+        write_ms=total_ms,
+        write_max_ms=total_ms,
+        persist_ms=persist_ms,
+        persist_max_ms=persist_ms,
     )
 
 
@@ -911,7 +991,7 @@ def _after_request(response):
     t_start = freq.environ.get("_t_start")
     if t_start is not None:
         elapsed_ms = (time.monotonic() - t_start) * 1000
-        log.info("request %s %s -> %d (%.1fms)", freq.method, freq.path, response.status_code, elapsed_ms)
+        _record(req_n=1, req_ms=elapsed_ms, req_max_ms=elapsed_ms)
     return response
 
 
