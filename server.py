@@ -10,7 +10,7 @@ Persistence:
   - Raft currentTerm + votedFor persisted with fsync before responding to RPCs
 
 Raft leader election:
-  - Election timeout: 500–1000ms (randomized)
+  - Election timeout: 500-1000ms (randomized)
   - Heartbeat interval: 100ms
   - Quorum: majority of cluster size
   - Leader steps down immediately after any heartbeat round that fails to achieve quorum
@@ -51,11 +51,12 @@ RAFT_FILE = "raft_state.json"
 
 ELECTION_TIMEOUT_MIN = 0.5   # seconds
 ELECTION_TIMEOUT_MAX = 1.0
-HEARTBEAT_INTERVAL = 0.1     # seconds
-RPC_TIMEOUT = 0.15           # seconds — kept short so heartbeat rounds complete well within election timeout
+HEARTBEAT_INTERVAL = 0.05    # seconds — 50 ms, fast enough to detect quorum loss quickly
+RPC_TIMEOUT = 0.07           # seconds — must be < HEARTBEAT_INTERVAL so rounds don't cascade
 
-# Followers stop redirecting to a leader they haven't heard from in this window.
-LEADER_STALE_THRESHOLD = 2 * HEARTBEAT_INTERVAL  # 200 ms
+# Followers stop redirecting / reporting a stale leader after this window.
+# Must be > HEARTBEAT_INTERVAL + RPC_TIMEOUT to avoid false negatives between heartbeats.
+LEADER_STALE_THRESHOLD = 0.3  # 300 ms
 
 # ---------------------------------------------------------------------------
 # Self address detection
@@ -384,8 +385,15 @@ def _run_election(term: int, peers: list[str]) -> None:
     cluster_size = len(peers) + 1
     quorum = cluster_size // 2 + 1
 
+    # Single-node cluster: self-vote is already quorum.
+    if not peers:
+        with _raft_lock:
+            if _role == "candidate" and _current_term == term:
+                _become_leader()
+        return
+
     futures: dict = {}
-    with ThreadPoolExecutor(max_workers=max(len(peers), 1)) as ex:
+    with ThreadPoolExecutor(max_workers=len(peers)) as ex:
         for peer in peers:
             futures[ex.submit(_rpc_request_vote, peer, term)] = peer
 
@@ -504,6 +512,18 @@ def raft_request_vote():
     cand_id = body["candidate-id"]
 
     with _raft_lock:
+        # Disruptive-server prevention (Raft §6): if we are a follower with a
+        # known leader and heard from it recently, reject higher-term votes to
+        # protect a working cluster from partitioned candidates.
+        if (cand_term > _current_term
+                and _role == "follower"
+                and _leader is not None
+                and (time.monotonic() - _leader_last_contact) < ELECTION_TIMEOUT_MIN):
+            return Response(
+                json.dumps({"term": _current_term, "vote-granted": False}),
+                status=200, content_type="application/json",
+            )
+
         if cand_term > _current_term:
             _step_down(cand_term)
 
@@ -558,12 +578,21 @@ def raft_append_entries():
 @app.route("/cluster/info", methods=["GET"])
 def cluster_info():
     with _raft_lock:
-        info = {
-            "role": _role,
-            "term": _current_term,
-            "leader": _leader,
-            "peers": sorted(PEERS),
-        }
+        role = _role
+        term = _current_term
+        leader = _leader
+        contact_age = time.monotonic() - _leader_last_contact
+
+    # Only report a leader address if it's current.
+    if role != "leader" and (leader is None or contact_age > LEADER_STALE_THRESHOLD):
+        leader = None
+
+    info = {
+        "role": role,
+        "term": term,
+        "leader": leader,
+        "peers": sorted(PEERS),
+    }
     return Response(json.dumps(info), status=200, content_type="application/json")
 
 
@@ -668,4 +697,11 @@ atexit.register(_checkpoint)
 threading.Thread(target=_heartbeat_loop, daemon=True).start()
 
 with _raft_lock:
-    _reset_election_timer()
+    if not PEERS:
+        # Single-node cluster: become leader immediately.
+        _current_term += 1
+        _voted_for = SELF_ADDR
+        _save_raft_state()
+        _become_leader()
+    else:
+        _reset_election_timer()
