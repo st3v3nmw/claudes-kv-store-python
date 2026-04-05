@@ -521,26 +521,29 @@ def _run_election(term: int, peers: list[str],
             ex.submit(_rpc_request_vote, p, term, last_log_index, last_log_term): p
             for p in peers
         }
-        for fut in as_completed(futs, timeout=VOTE_RPC_TIMEOUT):
-            peer = futs[fut]
-            try:
-                granted, peer_term = fut.result()
-            except Exception:
-                continue
+        try:
+            for fut in as_completed(futs, timeout=VOTE_RPC_TIMEOUT + 0.05):
+                peer = futs[fut]
+                try:
+                    granted, peer_term = fut.result()
+                except Exception:
+                    continue
 
-            with _raft_lock:
-                if _role != "candidate" or _current_term != term:
-                    return
-                if peer_term > _current_term:
-                    _step_down(peer_term)
-                    return
-                if granted:
-                    votes.add(peer)
-                    log.info("vote from %s term=%d votes=%d/%d",
-                             peer, term, len(votes), quorum)
-                    if len(votes) >= quorum:
-                        _become_leader()
+                with _raft_lock:
+                    if _role != "candidate" or _current_term != term:
                         return
+                    if peer_term > _current_term:
+                        _step_down(peer_term)
+                        return
+                    if granted:
+                        votes.add(peer)
+                        log.info("vote from %s term=%d votes=%d/%d",
+                                 peer, term, len(votes), quorum)
+                        if len(votes) >= quorum:
+                            _become_leader()
+                            return
+        except TimeoutError:
+            pass  # election didn't gather quorum in time; next timeout will retry
 
 
 # ---------------------------------------------------------------------------
