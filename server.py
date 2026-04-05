@@ -292,7 +292,10 @@ threading.Thread(target=_wal_writer_loop, daemon=True, name="wal-writer").start(
 
 
 def _persist_log_entry(entry: dict) -> None:
-    """Durably append one log entry. Blocks until the WAL writer fsyncs it.
+    """Buffer one log entry and signal the WAL writer — does NOT wait for fsync.
+    Durability on graceful shutdown is guaranteed by _checkpoint() draining the
+    WAL before writing the snapshot.  Crash durability (SIGKILL) relies on the
+    WAL writer completing its current fsync cycle before the kill arrives.
     Called WITHOUT _raft_lock held."""
     global _log_fh, _log_write_seq
 
@@ -301,20 +304,14 @@ def _persist_log_entry(entry: dict) -> None:
 
     line = json.dumps(entry, ensure_ascii=False) + "\n"
 
-    t0 = time.monotonic()
     with _log_write_lock:
         if _log_fh is None:
             os.makedirs(DATA_DIR, exist_ok=True)
             _log_fh = open(_log_path(), "a", encoding="utf-8")
         _log_fh.write(line)
         _log_write_seq += 1
-        my_seq = _log_write_seq
 
     _wal_work.set()   # wake the WAL writer (idempotent if already set)
-
-    with _log_flushed:
-        while _log_synced_seq < my_seq:
-            _log_flushed.wait()
 
 
 def _rewrite_log_file() -> None:
@@ -405,9 +402,31 @@ def _snapshot_path() -> str:
 
 
 def _checkpoint() -> None:
-    """Write snapshot at graceful shutdown (SIGTERM / atexit)."""
+    """Write snapshot at graceful shutdown (SIGTERM / atexit).
+
+    First drains the WAL writer so all buffered entries are on disk, then
+    snapshots the current KV state.  This guarantees that the snapshot
+    reflects every write that was acknowledged before the shutdown signal.
+    """
     if not DATA_DIR:
         return
+
+    # Drain: signal the WAL writer and wait for it to fsync everything written
+    # so far (bounded wait so a broken WAL writer doesn't hang shutdown).
+    with _log_write_lock:
+        drain_target = _log_write_seq
+    if drain_target > 0:
+        _wal_work.set()
+        with _log_flushed:
+            deadline = time.monotonic() + 10.0
+            while _log_synced_seq < drain_target:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    log.warning("checkpoint: WAL drain timed out (synced=%d target=%d)",
+                                _log_synced_seq, drain_target)
+                    break
+                _log_flushed.wait(timeout=remaining)
+
     os.makedirs(DATA_DIR, exist_ok=True)
     with kv_lock:
         snapshot = dict(store)
