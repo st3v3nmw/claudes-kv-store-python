@@ -4,14 +4,14 @@ Build a distributed key-value store from scratch using the Raft consensus algori
 
 ## Stages
 
-1. **[http-api](https://clstr.io/kv-store/http-api/)** - Store and Retrieve Data
-2. **[persistence](https://clstr.io/kv-store/persistence/)** - Data Survives SIGTERM
-3. **[crash-recovery](https://clstr.io/kv-store/crash-recovery/)** - Data Survives SIGKILL
-4. **[leader-election](https://clstr.io/kv-store/leader-election/)** - Cluster Elects and Maintains Leader
-5. **[log-replication](https://clstr.io/kv-store/log-replication/)** - Data Replicates to All Nodes
-6. **[membership-changes](https://clstr.io/kv-store/membership-changes/)** - Add and Remove Nodes Dynamically
-7. **[fault-tolerance](https://clstr.io/kv-store/fault-tolerance/)** - Cluster Survives Failures and Partitions
-8. **[log-compaction](https://clstr.io/kv-store/log-compaction/)** - System Manages Log Growth
+1. **[http-api](https://clstr.io/kv-store/http-api/)** - Implement a basic key-value store with GET/PUT/DELETE operations over HTTP
+2. **[persistence](https://clstr.io/kv-store/persistence/)** - Add durability so data survives clean shutdowns (SIGTERM)
+3. **[crash-recovery](https://clstr.io/kv-store/crash-recovery/)** - Ensure consistency after unclean shutdowns (SIGKILL)
+4. **[leader-election](https://clstr.io/kv-store/leader-election/)** - Form a cluster and elect a leader using Raft
+5. **[log-replication](https://clstr.io/kv-store/log-replication/)** - Replicate operations from leader to followers with strong consistency
+6. **[log-compaction](https://clstr.io/kv-store/log-compaction/)** - Prevent unbounded log growth through snapshots and truncation
+7. **[membership-changes](https://clstr.io/kv-store/membership-changes/)** - Add/remove nodes one at a time without downtime
+8. **[joint-consensus](https://clstr.io/kv-store/joint-consensus/)** - Add/remove multiple nodes simultaneously using joint consensus
 
 ## Getting Started
 
