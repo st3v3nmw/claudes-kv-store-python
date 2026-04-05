@@ -30,6 +30,7 @@ import atexit
 import json
 import logging
 import os
+import queue as _queue_module
 import random
 import socket
 import threading
@@ -917,35 +918,54 @@ def _leader_check() -> Response | None:
     return Response("no leader\n", status=503)
 
 
-def _leader_write(command: dict) -> None:
-    """Append command to log, commit, and apply to store.
-    Pre-replication shortcut: leader commits immediately without waiting for
-    follower acks.  This changes in the log-replication stage."""
+# ---------------------------------------------------------------------------
+# Write actor — single thread owns all mutable Raft/KV state for writes.
+#
+# HTTP threads enqueue (command, done_event, t0) and block on done_event.
+# This eliminates _raft_lock contention between HTTP threads entirely:
+# the actor is the only writer; it processes one command at a time with no
+# lock competition.  Matches the Go reference batch-writer architecture.
+# ---------------------------------------------------------------------------
+
+_write_queue: _queue_module.SimpleQueue = _queue_module.SimpleQueue()
+
+
+def _write_worker_loop() -> None:
+    """Single-threaded actor: dequeue write commands, execute, signal callers."""
     global _commit_index
+    while True:
+        command, done_event, t0 = _write_queue.get()
+        try:
+            with _raft_lock:
+                idx, entry = _log_append_mem(_current_term, command)
+                _commit_index = idx
+                _apply_committed_entries()
 
-    t0 = time.monotonic()
+            t1 = time.monotonic()
+            _persist_log_entry(entry)   # async WAL, does not block
+            t2 = time.monotonic()
 
-    # Single lock acquisition: append, commit, and apply atomically.
-    # Persist happens after the lock is released (WAL writer is async).
-    # Halves _raft_lock contention vs. the two-acquisition pattern.
-    with _raft_lock:
-        idx, entry = _log_append_mem(_current_term, command)
-        _commit_index = idx
-        _apply_committed_entries()
+            total_ms   = (t2 - t0) * 1000
+            persist_ms = (t2 - t1) * 1000
+            _record(
+                write_n=1,
+                write_ms=total_ms,
+                write_max_ms=total_ms,
+                persist_ms=persist_ms,
+                persist_max_ms=persist_ms,
+            )
+        finally:
+            done_event.set()
 
-    t1 = time.monotonic()
-    _persist_log_entry(entry)   # async WAL, does not block
-    t2 = time.monotonic()
 
-    total_ms   = (t2 - t0) * 1000
-    persist_ms = (t2 - t1) * 1000
-    _record(
-        write_n=1,
-        write_ms=total_ms,
-        write_max_ms=total_ms,
-        persist_ms=persist_ms,
-        persist_max_ms=persist_ms,
-    )
+threading.Thread(target=_write_worker_loop, daemon=True, name="write-worker").start()
+
+
+def _leader_write(command: dict) -> None:
+    """Enqueue a write command and block until the write actor processes it."""
+    done = threading.Event()
+    _write_queue.put((command, done, time.monotonic()))
+    done.wait()
 
 
 @app.route("/kv/", methods=["GET", "PUT", "DELETE"])
