@@ -13,7 +13,7 @@ Raft leader election:
   - Election timeout: 500–1000ms (randomized)
   - Heartbeat interval: 100ms
   - Quorum: majority of cluster size
-  - Leader lease: step down after LEADER_LEASE_DURATION without quorum acks
+  - Leader steps down immediately after any heartbeat round that fails to achieve quorum
 """
 
 import atexit
@@ -52,14 +52,9 @@ RAFT_FILE = "raft_state.json"
 ELECTION_TIMEOUT_MIN = 0.5   # seconds
 ELECTION_TIMEOUT_MAX = 1.0
 HEARTBEAT_INTERVAL = 0.1     # seconds
-RPC_TIMEOUT = 0.25           # seconds
-
-# Leader steps down if it can't get quorum acks in this window.
-LEADER_LEASE_DURATION = 3 * HEARTBEAT_INTERVAL   # 300 ms
+RPC_TIMEOUT = 0.15           # seconds — kept short so heartbeat rounds complete well within election timeout
 
 # Followers stop redirecting to a leader they haven't heard from in this window.
-# 2× heartbeat = 200ms: tight enough to detect a dead/partitioned leader quickly
-# while still tolerating 1 missed heartbeat under normal load.
 LEADER_STALE_THRESHOLD = 2 * HEARTBEAT_INTERVAL  # 200 ms
 
 # ---------------------------------------------------------------------------
@@ -221,16 +216,6 @@ _leader: str | None = None
 _leader_last_contact: float = 0.0   # monotonic time of last valid AppendEntries
 _votes_received: set[str] = set()
 
-# Leader lease via per-cycle quorum tracking.
-#
-# Each heartbeat cycle increments _hb_cycle. When a peer acks, we record the
-# cycle ID in _peer_ack_cycle[peer]. Quorum is counted as peers whose last ack
-# was in the current or immediately previous cycle. Old acks (from before a
-# partition) age out after 2 cycles (200ms), preventing stale quorum renewal.
-_leader_lease: float = 0.0          # step down when monotonic > this
-_hb_cycle: int = 0                  # incremented each heartbeat send
-_peer_ack_cycle: dict[str, int] = {}  # peer -> cycle of last successful ack
-
 # Election timer
 _election_timer: threading.Timer | None = None
 _timer_version: int = 0
@@ -306,19 +291,15 @@ def _step_down(new_term: int, new_leader: str | None = None) -> None:
 
 def _become_leader() -> None:
     """Transition to leader. Must hold _raft_lock."""
-    global _role, _leader, _leader_lease, _hb_cycle, _peer_ack_cycle
+    global _role, _leader
     _role = "leader"
     _leader = SELF_ADDR
-    _hb_cycle += 1
-    _peer_ack_cycle = {}
-    _leader_lease = time.monotonic() + LEADER_LEASE_DURATION
     _cancel_election_timer()
     log.info("became leader term=%d", _current_term)
-    # Send initial heartbeats without waiting for the 100ms loop
+    # Immediately notify followers without waiting for the heartbeat loop.
     term = _current_term
-    cycle = _hb_cycle
     peers = list(PEERS)
-    threading.Thread(target=_broadcast_heartbeat, args=(term, cycle, peers), daemon=True).start()
+    threading.Thread(target=_broadcast_heartbeat, args=(term, peers), daemon=True).start()
 
 
 def _start_election() -> None:
@@ -434,57 +415,80 @@ def _run_election(term: int, peers: list[str]) -> None:
 # Heartbeat sender
 # ---------------------------------------------------------------------------
 
-def _handle_heartbeat_response(peer: str, term: int, cycle: int) -> None:
-    global _leader_lease
-    success, peer_term = _rpc_append_entries(peer, term)
-    with _raft_lock:
-        if peer_term > _current_term:
-            _step_down(peer_term)
-            return
-        if success and _role == "leader" and _current_term == term:
-            _peer_ack_cycle[peer] = cycle
-            # Only count acks from current or previous heartbeat cycle.
-            # This ensures pre-partition acks (from dead/unreachable nodes) age
-            # out within 2 cycles (200ms) rather than lingering in a time window.
-            recent_acks = sum(1 for c in _peer_ack_cycle.values() if c >= _hb_cycle - 1)
-            cluster_size = len(PEERS) + 1
-            quorum = cluster_size // 2 + 1
-            if recent_acks + 1 >= quorum:  # +1 for self
-                _leader_lease = time.monotonic() + LEADER_LEASE_DURATION
+def _fire_heartbeat(peer: str, term: int) -> None:
+    """Send a single fire-and-forget heartbeat. Only acts on higher-term responses."""
+    _, peer_term = _rpc_append_entries(peer, term)
+    if peer_term > term:
+        with _raft_lock:
+            if peer_term > _current_term:
+                _step_down(peer_term)
 
 
-def _broadcast_heartbeat(term: int, cycle: int, peers: list[str]) -> None:
+def _broadcast_heartbeat(term: int, peers: list[str]) -> None:
+    """Fire-and-forget heartbeats (used for immediate notification on leader election)."""
     for peer in peers:
-        threading.Thread(
-            target=_handle_heartbeat_response,
-            args=(peer, term, cycle),
-            daemon=True,
-        ).start()
+        threading.Thread(target=_fire_heartbeat, args=(peer, term), daemon=True).start()
+
+
+def _heartbeat_round(term: int, peers: list[str]) -> tuple[int, int]:
+    """Send heartbeats to all peers, wait for responses.
+
+    Returns (ack_count_including_self, max_peer_term).
+    Exits early once quorum is confirmed to minimise latency.
+    """
+    if not peers:
+        return 1, 0
+
+    cluster_size = len(peers) + 1
+    quorum = cluster_size // 2 + 1
+    ack_count = 1  # self always acks
+    max_term = 0
+
+    with ThreadPoolExecutor(max_workers=len(peers)) as ex:
+        futs = {ex.submit(_rpc_append_entries, p, term): p for p in peers}
+        for f in as_completed(futs, timeout=RPC_TIMEOUT):
+            try:
+                ok, peer_term = f.result()
+            except Exception:
+                ok, peer_term = False, 0
+            if peer_term > max_term:
+                max_term = peer_term
+            if ok:
+                ack_count += 1
+            if ack_count >= quorum:
+                break  # No need to wait for remaining peers
+
+    return ack_count, max_term
 
 
 def _heartbeat_loop() -> None:
-    """Daemon thread: send AppendEntries heartbeats every 100ms when leader."""
-    global _hb_cycle
+    """Daemon thread: synchronous heartbeat rounds every HEARTBEAT_INTERVAL.
+
+    After each round: step down immediately if quorum was not achieved.
+    This means partition detection latency = HEARTBEAT_INTERVAL + RPC_TIMEOUT.
+    """
     while True:
         time.sleep(HEARTBEAT_INTERVAL)
         with _raft_lock:
             if _role != "leader":
                 continue
-            # Lease expired: quorum lost (partition or too many failures).
-            # Jump directly to candidate rather than follower so we send a
-            # RequestVote with a higher term immediately. Followers that
-            # receive it will call _step_down(new_term) and clear _leader,
-            # returning 503 within one RTT rather than waiting for the
-            # election timeout (500-1000ms) to fire.
-            if time.monotonic() > _leader_lease:
-                log.info("lease expired term=%d — triggering election", _current_term)
-                _start_election()
-                continue
-            _hb_cycle += 1
-            cycle = _hb_cycle
             term = _current_term
             peers = list(PEERS)
-        _broadcast_heartbeat(term, cycle, peers)
+
+        ack_count, max_term = _heartbeat_round(term, peers)
+
+        with _raft_lock:
+            if _role != "leader" or _current_term != term:
+                continue
+            if max_term > _current_term:
+                _step_down(max_term)
+                continue
+            cluster_size = len(PEERS) + 1
+            quorum = cluster_size // 2 + 1
+            if ack_count < quorum:
+                log.info("quorum lost (%d/%d) term=%d — stepping down",
+                         ack_count, quorum, _current_term)
+                _step_down(_current_term)
 
 
 # ---------------------------------------------------------------------------
