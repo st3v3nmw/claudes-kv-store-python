@@ -2,18 +2,28 @@
 Distributed Key-Value Store — leader-election stage.
 
 Run: gunicorn --config gunicorn.conf.py server:app
-Env: DATA_DIR, PEERS (comma-separated peer addresses, e.g. "10.0.0.2:8080,10.0.0.3:8080")
+Env: DATA_DIR, PEERS (comma-separated peer addresses)
 
-Persistence:
-  - WAL with group-commit + fsync for crash durability (SIGKILL)
-  - Snapshot on graceful shutdown (SIGTERM) via atexit
-  - Raft currentTerm + votedFor persisted with fsync before responding to RPCs
+Architecture
+------------
+The Raft log is the source of truth for KV state.  Each entry carries
+{index, term, op, key?, value?}.  The leader appends, immediately commits
+(pre-replication shortcut; changes in log-replication stage), and applies
+to the in-memory store.
 
-Raft leader election:
-  - Election timeout: 500-1000ms (randomized)
-  - Heartbeat interval: 100ms
-  - Quorum: majority of cluster size
-  - Leader steps down immediately after any heartbeat round that fails to achieve quorum
+Persistence (files under DATA_DIR):
+  raft_state.json  — current_term, voted_for          (fsync on vote/term change)
+  raft_log.jsonl   — log entries, one JSON line each  (group-commit fsync per append)
+  snapshot.json    — materialised KV dict              (fsync on SIGTERM)
+
+Recovery: load snapshot → load raft_state → replay all log entries
+(single-node: every appended entry is committed immediately, so applying
+all of them on recovery is always correct).
+
+Raft timing:
+  Election timeout : 500–1000 ms (randomised)
+  Heartbeat        : 50 ms
+  RPC timeout      : 70 ms
 """
 
 import atexit
@@ -42,32 +52,35 @@ app = Flask(__name__)
 # Configuration
 # ---------------------------------------------------------------------------
 
-DATA_DIR: str = os.environ.get("DATA_DIR", "")
-PEERS: list[str] = [p.strip() for p in os.environ.get("PEERS", "").split(",") if p.strip()]
-
-SNAPSHOT_FILE = "snapshot.json"
-WAL_FILE = "wal.jsonl"
-RAFT_FILE = "raft_state.json"
+DATA_DIR: str       = os.environ.get("DATA_DIR", "")
+PEERS:    list[str] = [p.strip() for p in os.environ.get("PEERS", "").split(",") if p.strip()]
 
 ELECTION_TIMEOUT_MIN = 0.5   # seconds
 ELECTION_TIMEOUT_MAX = 1.0
-HEARTBEAT_INTERVAL = 0.05    # seconds — 50 ms, fast enough to detect quorum loss quickly
-RPC_TIMEOUT = 0.07           # seconds — must be < HEARTBEAT_INTERVAL so rounds don't cascade
+HEARTBEAT_INTERVAL   = 0.05  # seconds
+# AppendEntries (heartbeat) involves no disk I/O on the receiver — short.
+HEARTBEAT_RPC_TIMEOUT = 0.07  # seconds
+# RequestVote triggers up to 2 fsyncs on the receiver (term + vote persist).
+# This can take 100–200 ms on virtualised filesystems (Docker macOS).
+VOTE_RPC_TIMEOUT = 0.35  # seconds
 
 # Followers stop redirecting / reporting a stale leader after this window.
-# Must be > HEARTBEAT_INTERVAL + RPC_TIMEOUT to avoid false negatives between heartbeats.
-LEADER_STALE_THRESHOLD = 0.3  # 300 ms
+# Must be > HEARTBEAT_INTERVAL + HEARTBEAT_RPC_TIMEOUT to avoid false negatives.
+LEADER_STALE_THRESHOLD = 0.3  # seconds
+
+RAFT_STATE_FILE = "raft_state.json"
+RAFT_LOG_FILE   = "raft_log.jsonl"
+SNAPSHOT_FILE   = "snapshot.json"
 
 # ---------------------------------------------------------------------------
-# Self address detection
+# Self-address detection
 # ---------------------------------------------------------------------------
 
 def _detect_self_addr() -> str:
     if PEERS:
-        peer_ip = PEERS[0].split(":")[0]
         try:
             s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            s.connect((peer_ip, 80))
+            s.connect((PEERS[0].split(":")[0], 80))
             ip = s.getsockname()[0]
             s.close()
             return f"{ip}:8080"
@@ -81,175 +94,276 @@ def _detect_self_addr() -> str:
 SELF_ADDR: str = _detect_self_addr()
 
 # ---------------------------------------------------------------------------
-# KV store state
+# In-memory KV state
 # ---------------------------------------------------------------------------
 
-store: dict[str, str] = {}
-kv_lock = threading.Lock()
+store:   dict[str, str] = {}
+kv_lock: threading.RLock = threading.RLock()  # always acquired after _raft_lock
 
 # ---------------------------------------------------------------------------
-# WAL with group-commit
+# Raft log
+#
+# Entries: {index, term, op, key?, value?}  — 1-indexed externally.
+# All mutations require _raft_lock.
 # ---------------------------------------------------------------------------
 
-_wal_cond = threading.Condition()
-_wal_fh = None
-_write_seq: int = 0
-_synced_seq: int = 0
-_sync_in_progress: bool = False
+_raft_log:     list[dict] = []
+_commit_index: int        = 0   # highest index known to be committed
+_last_applied: int        = 0   # highest index applied to store
 
 
-def _snapshot_path() -> str:
-    return os.path.join(DATA_DIR, SNAPSHOT_FILE)
+def _log_last_index() -> int:
+    return len(_raft_log)
 
 
-def _wal_path() -> str:
-    return os.path.join(DATA_DIR, WAL_FILE)
+def _log_last_term() -> int:
+    return _raft_log[-1]["term"] if _raft_log else 0
 
 
-def _raft_path() -> str:
-    return os.path.join(DATA_DIR, RAFT_FILE)
+def _log_term_at(index: int) -> int:
+    """Term of entry at 1-based index, 0 if out of range."""
+    if index <= 0 or index > len(_raft_log):
+        return 0
+    return _raft_log[index - 1]["term"]
 
 
-def _append_wal(entry: dict) -> None:
-    global _wal_fh, _write_seq, _synced_seq, _sync_in_progress
+def _log_entries_from(from_index: int) -> list[dict]:
+    """Entries starting at 1-based from_index."""
+    if from_index > len(_raft_log):
+        return []
+    return _raft_log[from_index - 1:]
+
+
+def _log_append_mem(term: int, command: dict) -> tuple[int, dict]:
+    """Append one entry to the in-memory log. Returns (index, entry). Caller holds _raft_lock."""
+    entry = {"index": len(_raft_log) + 1, "term": term, **command}
+    _raft_log.append(entry)
+    return entry["index"], entry
+
+
+def _log_truncate_after(index: int) -> None:
+    """Remove entries with 1-based index > given value. Caller holds _raft_lock."""
+    del _raft_log[index:]
+
+
+def _apply_committed_entries() -> None:
+    """Apply log[_last_applied.._commit_index] to store. Caller holds _raft_lock."""
+    global _last_applied
+    while _last_applied < _commit_index:
+        entry = _raft_log[_last_applied]   # _last_applied is 0-based index of next entry
+        _last_applied += 1
+        op = entry.get("op")
+        with kv_lock:
+            if op == "put":
+                store[entry["key"]] = entry["value"]
+            elif op == "delete":
+                store.pop(entry["key"], None)
+            elif op == "clear":
+                store.clear()
+
+
+# ---------------------------------------------------------------------------
+# Raft log file — append-only with group-commit fsync
+#
+# Only log entries are written here; term/vote live in raft_state.json.
+# Truncation (rare, follower conflict) rewrites the whole file.
+# ---------------------------------------------------------------------------
+
+_log_cond:            threading.Condition = threading.Condition()
+_log_fh                                   = None   # open file handle
+_log_write_seq:       int                 = 0
+_log_synced_seq:      int                 = 0
+_log_sync_in_progress: bool              = False
+
+
+def _log_path() -> str:
+    return os.path.join(DATA_DIR, RAFT_LOG_FILE)
+
+
+def _persist_log_entry(entry: dict) -> None:
+    """Durably append one log entry. Blocks until fsync covers this entry.
+    Called WITHOUT _raft_lock held."""
+    global _log_fh, _log_write_seq, _log_synced_seq, _log_sync_in_progress
+
+    if not DATA_DIR:
+        return
 
     line = json.dumps(entry, ensure_ascii=False) + "\n"
-    fh = None
+    fh     = None
     target = 0
 
-    with _wal_cond:
-        if _wal_fh is None:
+    with _log_cond:
+        if _log_fh is None:
             os.makedirs(DATA_DIR, exist_ok=True)
-            _wal_fh = open(_wal_path(), "a", encoding="utf-8")
+            _log_fh = open(_log_path(), "a", encoding="utf-8")
+        _log_fh.write(line)
+        _log_write_seq += 1
+        my_seq = _log_write_seq
 
-        _wal_fh.write(line)
-        _write_seq += 1
-        my_seq = _write_seq
-
-        while _synced_seq < my_seq:
-            if not _sync_in_progress:
-                _sync_in_progress = True
-                target = _write_seq
-                fh = _wal_fh
+        while _log_synced_seq < my_seq:
+            if not _log_sync_in_progress:
+                _log_sync_in_progress = True
+                target = _log_write_seq
+                fh     = _log_fh
                 break
-            _wal_cond.wait()
+            _log_cond.wait()
 
     if fh is None:
-        return
+        return  # another thread's fsync covered us
 
     try:
         fh.flush()
         os.fsync(fh.fileno())
     finally:
-        with _wal_cond:
-            _synced_seq = target
-            _sync_in_progress = False
-            _wal_cond.notify_all()
+        with _log_cond:
+            _log_synced_seq    = target
+            _log_sync_in_progress = False
+            _log_cond.notify_all()
 
 
-def _checkpoint() -> None:
-    global _wal_fh
+def _rewrite_log_file() -> None:
+    """Rewrite the log file from the in-memory log (used after truncation).
+    Caller holds _raft_lock."""
+    global _log_fh
 
     if not DATA_DIR:
         return
+
+    with _log_cond:
+        if _log_fh is not None:
+            _log_fh.close()
+            _log_fh = None
 
     os.makedirs(DATA_DIR, exist_ok=True)
-
-    with kv_lock:
-        snapshot = dict(store)
-
-    tmp = _snapshot_path() + ".tmp"
+    tmp = _log_path() + ".tmp"
     with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(snapshot, f, ensure_ascii=False)
-    os.replace(tmp, _snapshot_path())
-
-    with _wal_cond:
-        if _wal_fh is not None:
-            _wal_fh.close()
-            _wal_fh = None
-
-    open(_wal_path(), "w").close()
+        for entry in _raft_log:
+            f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, _log_path())
 
 
-def _load_kv_data() -> None:
+def _load_log_file() -> None:
+    """Replay log entries from disk into _raft_log. Called at startup."""
     if not DATA_DIR:
         return
-
-    if os.path.exists(_snapshot_path()):
-        with open(_snapshot_path(), "r", encoding="utf-8") as f:
+    path = _log_path()
+    if not os.path.exists(path):
+        return
+    with open(path, encoding="utf-8") as f:
+        for raw in f:
+            raw = raw.strip()
+            if not raw:
+                continue
             try:
-                store.update(json.load(f))
+                _raft_log.append(json.loads(raw))
             except json.JSONDecodeError:
-                pass
-
-    if os.path.exists(_wal_path()):
-        with open(_wal_path(), "r", encoding="utf-8") as f:
-            for raw in f:
-                raw = raw.strip()
-                if not raw:
-                    continue
-                try:
-                    entry = json.loads(raw)
-                except json.JSONDecodeError:
-                    continue
-                op = entry.get("op")
-                if op == "put":
-                    store[entry["key"]] = entry["value"]
-                elif op == "delete":
-                    store.pop(entry["key"], None)
-                elif op == "clear":
-                    store.clear()
+                pass   # truncated tail from a crash — stop here
+                break
 
 
 # ---------------------------------------------------------------------------
-# Raft state
+# raft_state.json — term + votedFor only
 # ---------------------------------------------------------------------------
 
-_raft_lock = threading.Lock()
-
-# Persistent (must survive crashes)
-_current_term: int = 0
-_voted_for: str | None = None
-
-# Volatile
-_role: str = "follower"   # "follower" | "candidate" | "leader"
-_leader: str | None = None
-_leader_last_contact: float = 0.0   # monotonic time of last valid AppendEntries
-_votes_received: set[str] = set()
-
-# Election timer
-_election_timer: threading.Timer | None = None
-_timer_version: int = 0
+def _raft_state_path() -> str:
+    return os.path.join(DATA_DIR, RAFT_STATE_FILE)
 
 
 def _save_raft_state() -> None:
-    """Persist currentTerm + votedFor with fsync. Must hold _raft_lock."""
+    """Persist current_term and voted_for with fsync. Caller holds _raft_lock."""
     if not DATA_DIR:
         return
     os.makedirs(DATA_DIR, exist_ok=True)
-    tmp = _raft_path() + ".tmp"
+    tmp = _raft_state_path() + ".tmp"
     with open(tmp, "w") as f:
         json.dump({"current_term": _current_term, "voted_for": _voted_for}, f)
         f.flush()
         os.fsync(f.fileno())
-    os.replace(tmp, _raft_path())
+    os.replace(tmp, _raft_state_path())
 
 
 def _load_raft_state() -> None:
     global _current_term, _voted_for
-    if not DATA_DIR or not os.path.exists(_raft_path()):
+    if not DATA_DIR:
+        return
+    path = _raft_state_path()
+    if not os.path.exists(path):
         return
     try:
-        with open(_raft_path()) as f:
+        with open(path) as f:
             s = json.load(f)
-            _current_term = s.get("current_term", 0)
-            _voted_for = s.get("voted_for", None)
+        _current_term = s.get("current_term", 0)
+        _voted_for    = s.get("voted_for", None)
     except Exception:
         pass
 
 
 # ---------------------------------------------------------------------------
-# Election timer helpers (must hold _raft_lock when calling)
+# snapshot.json — materialised KV state (written on graceful shutdown)
+# ---------------------------------------------------------------------------
+
+def _snapshot_path() -> str:
+    return os.path.join(DATA_DIR, SNAPSHOT_FILE)
+
+
+def _checkpoint() -> None:
+    """Write snapshot at graceful shutdown (SIGTERM / atexit)."""
+    if not DATA_DIR:
+        return
+    os.makedirs(DATA_DIR, exist_ok=True)
+    with kv_lock:
+        snapshot = dict(store)
+    tmp = _snapshot_path() + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(snapshot, f, ensure_ascii=False)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, _snapshot_path())
+
+
+def _load_snapshot() -> None:
+    if not DATA_DIR:
+        return
+    path = _snapshot_path()
+    if not os.path.exists(path):
+        return
+    try:
+        with open(path, encoding="utf-8") as f:
+            with kv_lock:
+                store.update(json.load(f))
+    except Exception:
+        pass
+
+
+# ---------------------------------------------------------------------------
+# Raft persistent state
+# ---------------------------------------------------------------------------
+
+_raft_lock: threading.Lock = threading.Lock()
+
+_current_term: int       = 0
+_voted_for:    str | None = None
+
+# ---------------------------------------------------------------------------
+# Raft volatile state
+# ---------------------------------------------------------------------------
+
+_role:                str        = "follower"
+_leader:              str | None = None
+_leader_last_contact: float      = 0.0
+
+# Per-peer leader state — initialised in _become_leader
+_next_index:  dict[str, int] = {}
+_match_index: dict[str, int] = {}
+
+# Election timer
+_election_timer:  threading.Timer | None = None
+_timer_version:   int                    = 0
+
+# ---------------------------------------------------------------------------
+# Election timer helpers  (caller holds _raft_lock)
 # ---------------------------------------------------------------------------
 
 def _reset_election_timer() -> None:
@@ -258,7 +372,7 @@ def _reset_election_timer() -> None:
     version = _timer_version
     if _election_timer is not None:
         _election_timer.cancel()
-    timeout = random.uniform(ELECTION_TIMEOUT_MIN, ELECTION_TIMEOUT_MAX)
+    timeout       = random.uniform(ELECTION_TIMEOUT_MIN, ELECTION_TIMEOUT_MAX)
     _election_timer = threading.Timer(timeout, _on_election_timeout, args=[version])
     _election_timer.daemon = True
     _election_timer.start()
@@ -273,51 +387,53 @@ def _cancel_election_timer() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Raft role transitions (must hold _raft_lock when calling)
+# Role transitions  (caller holds _raft_lock)
 # ---------------------------------------------------------------------------
 
 def _step_down(new_term: int, new_leader: str | None = None) -> None:
-    """Revert to follower. Only clears votedFor (and saves) when term increases."""
-    global _current_term, _voted_for, _role, _leader
-    prev_role = _role
+    global _current_term, _voted_for, _role, _leader, _next_index, _match_index
     if new_term > _current_term:
         _current_term = new_term
-        _voted_for = None
+        _voted_for    = None
+        _next_index   = {}
+        _match_index  = {}
         _save_raft_state()
-    _role = "follower"
+    _role   = "follower"
     _leader = new_leader
     _reset_election_timer()
-    log.info("step_down term=%d leader=%s (was %s)", _current_term, new_leader, prev_role)
+    log.info("step_down term=%d leader=%s", _current_term, new_leader)
 
 
 def _become_leader() -> None:
-    """Transition to leader. Must hold _raft_lock."""
-    global _role, _leader
-    _role = "leader"
-    _leader = SELF_ADDR
+    global _role, _leader, _next_index, _match_index
+    _role        = "leader"
+    _leader      = SELF_ADDR
+    _next_index  = {p: _log_last_index() + 1 for p in PEERS}
+    _match_index = {p: 0 for p in PEERS}
     _cancel_election_timer()
     log.info("became leader term=%d", _current_term)
-    # Immediately notify followers without waiting for the heartbeat loop.
-    term = _current_term
+    term  = _current_term
     peers = list(PEERS)
     threading.Thread(target=_broadcast_heartbeat, args=(term, peers), daemon=True).start()
 
 
 def _start_election() -> None:
-    """Kick off a new election. Must hold _raft_lock."""
-    global _current_term, _voted_for, _role, _leader, _votes_received
+    global _current_term, _voted_for, _role, _leader
     _current_term += 1
-    _role = "candidate"
-    _voted_for = SELF_ADDR
-    _leader = None
-    _votes_received = {SELF_ADDR}
+    _role         = "candidate"
+    _voted_for    = SELF_ADDR
+    _leader       = None
     _save_raft_state()
     _reset_election_timer()
     log.info("election started term=%d", _current_term)
 
-    term = _current_term
-    peers = list(PEERS)
-    threading.Thread(target=_run_election, args=(term, peers), daemon=True).start()
+    term     = _current_term
+    peers    = list(PEERS)
+    last_idx = _log_last_index()
+    last_trm = _log_last_term()
+    threading.Thread(
+        target=_run_election, args=(term, peers, last_idx, last_trm), daemon=True
+    ).start()
 
 
 # ---------------------------------------------------------------------------
@@ -335,17 +451,18 @@ def _on_election_timeout(version: int) -> None:
 # Outbound RPCs
 # ---------------------------------------------------------------------------
 
-def _rpc_request_vote(peer: str, term: int) -> tuple[bool, int]:
+def _rpc_request_vote(peer: str, term: int,
+                      last_log_index: int, last_log_term: int) -> tuple[bool, int]:
     try:
         resp = http.post(
             f"http://{peer}/raft/request-vote",
             json={
-                "term": term,
-                "candidate-id": SELF_ADDR,
-                "last-log-index": 0,
-                "last-log-term": 0,
+                "term":           term,
+                "candidate-id":   SELF_ADDR,
+                "last-log-index": last_log_index,
+                "last-log-term":  last_log_term,
             },
-            timeout=RPC_TIMEOUT,
+            timeout=VOTE_RPC_TIMEOUT,
         )
         if resp.status_code == 200:
             data = resp.json()
@@ -355,19 +472,21 @@ def _rpc_request_vote(peer: str, term: int) -> tuple[bool, int]:
     return False, 0
 
 
-def _rpc_append_entries(peer: str, term: int) -> tuple[bool, int]:
+def _rpc_append_entries(peer: str, term: int,
+                        prev_log_index: int, prev_log_term: int,
+                        entries: list, leader_commit: int) -> tuple[bool, int]:
     try:
         resp = http.post(
             f"http://{peer}/raft/append-entries",
             json={
-                "term": term,
-                "leader-id": SELF_ADDR,
-                "prev-log-index": 0,
-                "prev-log-term": 0,
-                "entries": [],
-                "leader-commit": 0,
+                "term":           term,
+                "leader-id":      SELF_ADDR,
+                "prev-log-index": prev_log_index,
+                "prev-log-term":  prev_log_term,
+                "entries":        entries,
+                "leader-commit":  leader_commit,
             },
-            timeout=RPC_TIMEOUT,
+            timeout=HEARTBEAT_RPC_TIMEOUT,
         )
         if resp.status_code == 200:
             data = resp.json()
@@ -378,27 +497,29 @@ def _rpc_append_entries(peer: str, term: int) -> tuple[bool, int]:
 
 
 # ---------------------------------------------------------------------------
-# Election runner (background thread — no lock held on entry)
+# Election runner  (background thread — no lock on entry)
 # ---------------------------------------------------------------------------
 
-def _run_election(term: int, peers: list[str]) -> None:
+def _run_election(term: int, peers: list[str],
+                  last_log_index: int, last_log_term: int) -> None:
     cluster_size = len(peers) + 1
-    quorum = cluster_size // 2 + 1
+    quorum       = cluster_size // 2 + 1
 
-    # Single-node cluster: self-vote is already quorum.
     if not peers:
         with _raft_lock:
             if _role == "candidate" and _current_term == term:
                 _become_leader()
         return
 
-    futures: dict = {}
-    with ThreadPoolExecutor(max_workers=len(peers)) as ex:
-        for peer in peers:
-            futures[ex.submit(_rpc_request_vote, peer, term)] = peer
+    votes: set[str] = {SELF_ADDR}
 
-        for fut in as_completed(futures, timeout=ELECTION_TIMEOUT_MIN):
-            peer = futures[fut]
+    with ThreadPoolExecutor(max_workers=len(peers)) as ex:
+        futs = {
+            ex.submit(_rpc_request_vote, p, term, last_log_index, last_log_term): p
+            for p in peers
+        }
+        for fut in as_completed(futs, timeout=VOTE_RPC_TIMEOUT):
+            peer = futs[fut]
             try:
                 granted, peer_term = fut.result()
             except Exception:
@@ -411,21 +532,21 @@ def _run_election(term: int, peers: list[str]) -> None:
                     _step_down(peer_term)
                     return
                 if granted:
-                    _votes_received.add(peer)
-                    log.info("vote granted by %s term=%d votes=%d/%d",
-                             peer, term, len(_votes_received), quorum)
-                    if len(_votes_received) >= quorum:
+                    votes.add(peer)
+                    log.info("vote from %s term=%d votes=%d/%d",
+                             peer, term, len(votes), quorum)
+                    if len(votes) >= quorum:
                         _become_leader()
                         return
 
 
 # ---------------------------------------------------------------------------
-# Heartbeat sender
+# Heartbeat
 # ---------------------------------------------------------------------------
 
-def _fire_heartbeat(peer: str, term: int) -> None:
-    """Send a single fire-and-forget heartbeat. Only acts on higher-term responses."""
-    _, peer_term = _rpc_append_entries(peer, term)
+def _fire_heartbeat(peer: str, term: int, prev_idx: int, prev_trm: int,
+                    entries: list, commit: int) -> None:
+    _, peer_term = _rpc_append_entries(peer, term, prev_idx, prev_trm, entries, commit)
     if peer_term > term:
         with _raft_lock:
             if peer_term > _current_term:
@@ -433,28 +554,41 @@ def _fire_heartbeat(peer: str, term: int) -> None:
 
 
 def _broadcast_heartbeat(term: int, peers: list[str]) -> None:
-    """Fire-and-forget heartbeats (used for immediate notification on leader election)."""
+    """Fire-and-forget initial heartbeat on becoming leader."""
     for peer in peers:
-        threading.Thread(target=_fire_heartbeat, args=(peer, term), daemon=True).start()
+        threading.Thread(
+            target=_fire_heartbeat, args=(peer, term, 0, 0, [], 0), daemon=True
+        ).start()
 
 
 def _heartbeat_round(term: int, peers: list[str]) -> tuple[int, int]:
-    """Send heartbeats to all peers, wait for responses.
-
-    Returns (ack_count_including_self, max_peer_term).
-    Exits early once quorum is confirmed to minimise latency.
-    """
+    """Synchronous heartbeat round. Returns (ack_count_incl_self, max_peer_term)."""
     if not peers:
         return 1, 0
 
     cluster_size = len(peers) + 1
-    quorum = cluster_size // 2 + 1
-    ack_count = 1  # self always acks
-    max_term = 0
+    quorum       = cluster_size // 2 + 1
+    ack_count    = 1
+    max_term     = 0
+
+    with _raft_lock:
+        commit    = _commit_index
+        peer_args = {
+            peer: (
+                _next_index.get(peer, _log_last_index() + 1) - 1,
+                _log_term_at(_next_index.get(peer, _log_last_index() + 1) - 1),
+                [],      # entries — populated in log-replication stage
+                commit,
+            )
+            for peer in peers
+        }
 
     with ThreadPoolExecutor(max_workers=len(peers)) as ex:
-        futs = {ex.submit(_rpc_append_entries, p, term): p for p in peers}
-        for f in as_completed(futs, timeout=RPC_TIMEOUT):
+        futs = {
+            ex.submit(_rpc_append_entries, p, term, *args): p
+            for p, args in peer_args.items()
+        }
+        for f in as_completed(futs, timeout=HEARTBEAT_RPC_TIMEOUT):
             try:
                 ok, peer_term = f.result()
             except Exception:
@@ -464,23 +598,19 @@ def _heartbeat_round(term: int, peers: list[str]) -> tuple[int, int]:
             if ok:
                 ack_count += 1
             if ack_count >= quorum:
-                break  # No need to wait for remaining peers
+                break
 
     return ack_count, max_term
 
 
 def _heartbeat_loop() -> None:
-    """Daemon thread: synchronous heartbeat rounds every HEARTBEAT_INTERVAL.
-
-    After each round: step down immediately if quorum was not achieved.
-    This means partition detection latency = HEARTBEAT_INTERVAL + RPC_TIMEOUT.
-    """
+    """Daemon thread: synchronous heartbeat rounds every HEARTBEAT_INTERVAL."""
     while True:
         time.sleep(HEARTBEAT_INTERVAL)
         with _raft_lock:
             if _role != "leader":
                 continue
-            term = _current_term
+            term  = _current_term
             peers = list(PEERS)
 
         ack_count, max_term = _heartbeat_round(term, peers)
@@ -492,7 +622,7 @@ def _heartbeat_loop() -> None:
                 _step_down(max_term)
                 continue
             cluster_size = len(PEERS) + 1
-            quorum = cluster_size // 2 + 1
+            quorum       = cluster_size // 2 + 1
             if ack_count < quorum:
                 log.info("quorum lost (%d/%d) term=%d — stepping down",
                          ack_count, quorum, _current_term)
@@ -505,20 +635,25 @@ def _heartbeat_loop() -> None:
 
 @app.route("/raft/request-vote", methods=["POST"])
 def raft_request_vote():
-    global _current_term, _voted_for
+    global _voted_for
 
-    body = freq.get_json(force=True)
+    body      = freq.get_json(force=True)
     cand_term = body["term"]
-    cand_id = body["candidate-id"]
+    cand_id   = body["candidate-id"]
+    cand_lli  = body.get("last-log-index", 0)
+    cand_llt  = body.get("last-log-term",  0)
 
     with _raft_lock:
-        # Disruptive-server prevention (Raft §6): if we are a follower with a
-        # known leader and heard from it recently, reject higher-term votes to
-        # protect a working cluster from partitioned candidates.
+        # Disruptive-server prevention (Raft §6): a follower that has heard
+        # from a valid leader recently rejects higher-term votes.  We use
+        # LEADER_STALE_THRESHOLD (not ELECTION_TIMEOUT_MIN) so that the
+        # window expires before the election timeout fires — allowing
+        # legitimate elections after a crash while still protecting a
+        # working majority from partitioned candidates.
         if (cand_term > _current_term
                 and _role == "follower"
                 and _leader is not None
-                and (time.monotonic() - _leader_last_contact) < ELECTION_TIMEOUT_MIN):
+                and (time.monotonic() - _leader_last_contact) < LEADER_STALE_THRESHOLD):
             return Response(
                 json.dumps({"term": _current_term, "vote-granted": False}),
                 status=200, content_type="application/json",
@@ -527,9 +662,15 @@ def raft_request_vote():
         if cand_term > _current_term:
             _step_down(cand_term)
 
+        # Log up-to-date check (Raft §5.4.1)
+        my_lli = _log_last_index()
+        my_llt = _log_last_term()
+        log_ok = (cand_llt > my_llt) or (cand_llt == my_llt and cand_lli >= my_lli)
+
         grant = (
             cand_term >= _current_term
             and (_voted_for is None or _voted_for == cand_id)
+            and log_ok
         )
         if grant:
             _voted_for = cand_id
@@ -545,11 +686,15 @@ def raft_request_vote():
 
 @app.route("/raft/append-entries", methods=["POST"])
 def raft_append_entries():
-    global _current_term, _voted_for, _role, _leader, _leader_last_contact
+    global _current_term, _role, _leader, _leader_last_contact, _commit_index
 
-    body = freq.get_json(force=True)
-    leader_term = body["term"]
-    leader_id = body["leader-id"]
+    body          = freq.get_json(force=True)
+    leader_term   = body["term"]
+    leader_id     = body["leader-id"]
+    prev_log_idx  = body.get("prev-log-index", 0)
+    prev_log_trm  = body.get("prev-log-term",  0)
+    entries       = body.get("entries", [])
+    leader_commit = body.get("leader-commit", 0)
 
     with _raft_lock:
         if leader_term < _current_term:
@@ -569,6 +714,31 @@ def raft_append_entries():
 
         _leader_last_contact = time.monotonic()
 
+        # Log consistency check
+        if prev_log_idx > 0 and _log_term_at(prev_log_idx) != prev_log_trm:
+            return Response(
+                json.dumps({"term": _current_term, "success": False}),
+                status=200, content_type="application/json",
+            )
+
+        # Append new entries, truncating any conflicting ones first
+        for i, entry in enumerate(entries):
+            slot = prev_log_idx + 1 + i
+            if slot <= _log_last_index():
+                if _log_term_at(slot) != entry["term"]:
+                    _log_truncate_after(slot - 1)
+                    _raft_log.append(entry)
+            else:
+                _raft_log.append(entry)
+
+        if entries:
+            _rewrite_log_file()
+
+        # Advance commit index and apply
+        if leader_commit > _commit_index:
+            _commit_index = min(leader_commit, _log_last_index())
+            _apply_committed_entries()
+
         return Response(
             json.dumps({"term": _current_term, "success": True}),
             status=200, content_type="application/json",
@@ -578,22 +748,18 @@ def raft_append_entries():
 @app.route("/cluster/info", methods=["GET"])
 def cluster_info():
     with _raft_lock:
-        role = _role
-        term = _current_term
-        leader = _leader
+        role        = _role
+        term        = _current_term
+        leader      = _leader
         contact_age = time.monotonic() - _leader_last_contact
 
-    # Only report a leader address if it's current.
     if role != "leader" and (leader is None or contact_age > LEADER_STALE_THRESHOLD):
         leader = None
 
-    info = {
-        "role": role,
-        "term": term,
-        "leader": leader,
-        "peers": sorted(PEERS),
-    }
-    return Response(json.dumps(info), status=200, content_type="application/json")
+    return Response(
+        json.dumps({"role": role, "term": term, "leader": leader, "peers": sorted(PEERS)}),
+        status=200, content_type="application/json",
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -606,28 +772,41 @@ def health():
 
 
 # ---------------------------------------------------------------------------
-# Flask: KV routes — leader handles, followers redirect, no-leader → 503
+# Flask: KV routes
 # ---------------------------------------------------------------------------
 
 def _leader_check() -> Response | None:
-    """Return a redirect/error response if we're not the leader, else None."""
     with _raft_lock:
-        role = _role
-        leader = _leader
+        role        = _role
+        leader      = _leader
         contact_age = time.monotonic() - _leader_last_contact
 
     if role == "leader":
         return None
-
-    # Only redirect if we've heard from the leader recently.
     if leader is not None and contact_age <= LEADER_STALE_THRESHOLD:
         path = freq.full_path if freq.query_string else freq.path
-        return Response(
-            status=307,
-            headers={"Location": f"http://{leader}{path}"},
-        )
-
+        return Response(status=307, headers={"Location": f"http://{leader}{path}"})
     return Response("no leader\n", status=503)
+
+
+def _leader_write(command: dict) -> None:
+    """Append command to log, commit, and apply to store.
+    Pre-replication shortcut: leader commits immediately without waiting for
+    follower acks.  This changes in the log-replication stage."""
+    global _commit_index
+
+    # 1. Append to in-memory log (under lock)
+    with _raft_lock:
+        idx, entry = _log_append_mem(_current_term, command)
+
+    # 2. Persist the entry (group-commit fsync, lock released)
+    _persist_log_entry(entry)
+
+    # 3. Mark committed and apply to store (under lock)
+    with _raft_lock:
+        if _commit_index < idx:
+            _commit_index = idx
+            _apply_committed_entries()
 
 
 @app.route("/kv/", methods=["GET", "PUT", "DELETE"])
@@ -644,24 +823,18 @@ def kv(key: str = ""):
         value = freq.get_data(as_text=True)
         if not value:
             return Response("value cannot be empty\n", status=400)
-        if DATA_DIR:
-            _append_wal({"op": "put", "key": key, "value": value})
-        with kv_lock:
-            store[key] = value
+        _leader_write({"op": "put", "key": key, "value": value})
         return Response(status=200)
 
-    elif freq.method == "GET":
+    if freq.method == "GET":
         with kv_lock:
             value = store.get(key)
         if value is None:
             return Response("key not found\n", status=404)
         return Response(value, status=200)
 
-    elif freq.method == "DELETE":
-        if DATA_DIR:
-            _append_wal({"op": "delete", "key": key})
-        with kv_lock:
-            store.pop(key, None)
+    if freq.method == "DELETE":
+        _leader_write({"op": "delete", "key": key})
         return Response(status=200)
 
     return Response("method not allowed\n", status=405)
@@ -672,11 +845,7 @@ def clear():
     redir = _leader_check()
     if redir is not None:
         return redir
-
-    if DATA_DIR:
-        _append_wal({"op": "clear"})
-    with kv_lock:
-        store.clear()
+    _leader_write({"op": "clear"})
     return Response(status=200)
 
 
@@ -690,17 +859,23 @@ def method_not_allowed(_):
 # ---------------------------------------------------------------------------
 
 log.info("starting node=%s peers=%s", SELF_ADDR, PEERS)
-_load_kv_data()
+_load_snapshot()
 _load_raft_state()
-atexit.register(_checkpoint)
+_load_log_file()
 
+# Re-apply any log entries committed after the last snapshot.
+with _raft_lock:
+    _commit_index = _log_last_index()   # single-node: all entries are committed
+    _apply_committed_entries()
+
+atexit.register(_checkpoint)
 threading.Thread(target=_heartbeat_loop, daemon=True).start()
 
 with _raft_lock:
     if not PEERS:
-        # Single-node cluster: become leader immediately.
+        # Single-node: skip the election timeout, become leader immediately.
         _current_term += 1
-        _voted_for = SELF_ADDR
+        _voted_for     = SELF_ADDR
         _save_raft_state()
         _become_leader()
     else:
