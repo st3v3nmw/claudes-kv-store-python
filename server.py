@@ -54,6 +54,7 @@ app = Flask(__name__)
 
 DATA_DIR: str       = os.environ.get("DATA_DIR", "")
 PEERS:    list[str] = [p.strip() for p in os.environ.get("PEERS", "").split(",") if p.strip()]
+ADDR:     str       = os.environ.get("ADDR", "")   # own address, set by harness
 
 ELECTION_TIMEOUT_MIN = 0.5   # seconds
 ELECTION_TIMEOUT_MAX = 1.0
@@ -77,6 +78,8 @@ SNAPSHOT_FILE   = "snapshot.json"
 # ---------------------------------------------------------------------------
 
 def _detect_self_addr() -> str:
+    if ADDR:
+        return ADDR
     if PEERS:
         try:
             s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -757,7 +760,7 @@ def cluster_info():
         leader = None
 
     return Response(
-        json.dumps({"role": role, "term": term, "leader": leader, "peers": sorted(PEERS)}),
+        json.dumps({"id": SELF_ADDR, "role": role, "term": term, "leader": leader, "peers": sorted(PEERS)}),
         status=200, content_type="application/json",
     )
 
