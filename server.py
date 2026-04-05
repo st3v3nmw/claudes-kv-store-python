@@ -591,17 +591,23 @@ def _heartbeat_round(term: int, peers: list[str]) -> tuple[int, int]:
             ex.submit(_rpc_append_entries, p, term, *args): p
             for p, args in peer_args.items()
         }
-        for f in as_completed(futs, timeout=HEARTBEAT_RPC_TIMEOUT):
-            try:
-                ok, peer_term = f.result()
-            except Exception:
-                ok, peer_term = False, 0
-            if peer_term > max_term:
-                max_term = peer_term
-            if ok:
-                ack_count += 1
-            if ack_count >= quorum:
-                break
+        try:
+            # Use a slightly longer timeout than the per-RPC timeout so that
+            # in-flight requests can complete and return (False, 0) rather than
+            # racing against as_completed's deadline and raising TimeoutError.
+            for f in as_completed(futs, timeout=HEARTBEAT_RPC_TIMEOUT + 0.05):
+                try:
+                    ok, peer_term = f.result()
+                except Exception:
+                    ok, peer_term = False, 0
+                if peer_term > max_term:
+                    max_term = peer_term
+                if ok:
+                    ack_count += 1
+                if ack_count >= quorum:
+                    break
+        except TimeoutError:
+            pass  # return whatever ack_count we have — quorum check handles it
 
     return ack_count, max_term
 
@@ -616,7 +622,11 @@ def _heartbeat_loop() -> None:
             term  = _current_term
             peers = list(PEERS)
 
-        ack_count, max_term = _heartbeat_round(term, peers)
+        try:
+            ack_count, max_term = _heartbeat_round(term, peers)
+        except Exception:
+            log.exception("heartbeat_round raised — treating as quorum loss")
+            ack_count, max_term = 0, 0
 
         with _raft_lock:
             if _role != "leader" or _current_term != term:
