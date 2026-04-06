@@ -59,9 +59,10 @@ ADDR:     str       = os.environ.get("ADDR", "")
 ELECTION_TIMEOUT_MIN  = 0.5    # seconds
 ELECTION_TIMEOUT_MAX  = 1.0
 HEARTBEAT_INTERVAL    = 0.1    # seconds — 1/5 of election timeout min
-HEARTBEAT_RPC_TIMEOUT = 0.15   # seconds
+HEARTBEAT_RPC_TIMEOUT = 0.2    # seconds — generous but well below election timeout
 VOTE_RPC_TIMEOUT      = 0.4    # seconds — must complete within election timeout min
 LEADER_STALE_THRESHOLD = 0.3   # seconds — 3x heartbeat, << election timeout min
+HEARTBEAT_MISS_LIMIT  = 1      # consecutive missed rounds before leader steps down
 
 RAFT_STATE_FILE = "raft_state.json"
 RAFT_LOG_FILE   = "raft_log.jsonl"
@@ -519,32 +520,29 @@ async def _heartbeat_round(term: int) -> tuple[int, int]:
         asyncio.create_task(_rpc_append_entries(p, term, *args))
         for p, args in peer_args.items()
     ]
-    try:
-        for coro in asyncio.as_completed(tasks):
-            try:
-                ok, peer_term = await coro
-            except Exception:
-                ok, peer_term = False, 0
-            if peer_term > max_term:
-                max_term = peer_term
-            if ok:
-                ack_count += 1
-            if ack_count >= quorum:
-                break
-    finally:
-        for t in tasks:
-            t.cancel()
-        await asyncio.gather(*tasks, return_exceptions=True)
+    # Always wait for ALL peers — breaking early cancels outstanding RPCs and
+    # deprives slow followers of heartbeats, causing spurious elections.
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+    for result in results:
+        if isinstance(result, Exception):
+            continue
+        ok, peer_term = result
+        if peer_term > max_term:
+            max_term = peer_term
+        if ok:
+            ack_count += 1
 
     return ack_count, max_term
 
 
 async def _heartbeat_loop() -> None:
     """Fire periodic heartbeats while leader."""
+    consecutive_misses = 0
     while True:
         await asyncio.sleep(HEARTBEAT_INTERVAL)
         async with _raft_lock:
             if _role != "leader":
+                consecutive_misses = 0
                 continue
             term = _current_term
 
@@ -557,16 +555,25 @@ async def _heartbeat_loop() -> None:
         save = False
         async with _raft_lock:
             if _role != "leader" or _current_term != term:
+                consecutive_misses = 0
                 continue
             if max_term > _current_term:
                 save = _step_down(max_term)
+                consecutive_misses = 0
             else:
                 cluster_size = len(PEERS) + 1
                 quorum       = cluster_size // 2 + 1
                 if ack_count < quorum:
-                    log.info("quorum lost (%d/%d) term=%d — stepping down",
+                    consecutive_misses += 1
+                    log.info("quorum miss %d/%d (%d/%d acks) term=%d",
+                             consecutive_misses, HEARTBEAT_MISS_LIMIT,
                              ack_count, quorum, _current_term)
-                    _step_down(_current_term)
+                    if consecutive_misses >= HEARTBEAT_MISS_LIMIT:
+                        log.info("quorum lost — stepping down term=%d", _current_term)
+                        _step_down(_current_term)
+                        consecutive_misses = 0
+                else:
+                    consecutive_misses = 0
         if save:
             await _save_raft_state()
 
