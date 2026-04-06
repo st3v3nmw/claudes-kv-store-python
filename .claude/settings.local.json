@@ -2,6 +2,7 @@
   "permissions": {
     "allow": [
       "Bash(clstr --help)",
+      "Bash(clstr logs:*)",
       "Bash(clstr next:*)",
       "Bash(clstr status:*)",
       "Bash(clstr test:*)",
