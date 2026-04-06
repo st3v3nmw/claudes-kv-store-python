@@ -1,2 +1,2 @@
 #!/bin/sh
-exec gunicorn --config gunicorn.conf.py server:app
+exec python server.py
