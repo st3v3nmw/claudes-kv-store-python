@@ -167,18 +167,20 @@ def _snapshot_path() -> str:
     return os.path.join(DATA_DIR, SNAPSHOT_FILE)
 
 
-def _save_raft_state() -> None:
-    """Persist current_term and voted_for with fsync. Blocks event loop briefly;
-    called only on term/vote changes (rare — at most once per election)."""
+async def _save_raft_state() -> None:
+    """Persist current_term and voted_for with fsync via thread-pool executor."""
     if not DATA_DIR:
         return
-    os.makedirs(DATA_DIR, exist_ok=True)
-    tmp = _raft_state_path() + ".tmp"
-    with open(tmp, "w") as f:
-        json.dump({"current_term": _current_term, "voted_for": _voted_for}, f)
-        f.flush()
-        os.fsync(f.fileno())
-    os.replace(tmp, _raft_state_path())
+    data = {"current_term": _current_term, "voted_for": _voted_for}
+    def _write() -> None:
+        os.makedirs(DATA_DIR, exist_ok=True)
+        tmp = _raft_state_path() + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(data, f)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, _raft_state_path())
+    await asyncio.get_running_loop().run_in_executor(None, _write)
 
 
 def _load_raft_state() -> None:
@@ -297,7 +299,7 @@ def _reset_election_timer() -> None:
     if _election_task is not None:
         _election_task.cancel()
     timeout = random.uniform(ELECTION_TIMEOUT_MIN, ELECTION_TIMEOUT_MAX)
-    _election_task = asyncio.get_event_loop().create_task(
+    _election_task = asyncio.create_task(
         _election_timeout_coro(timeout), name="election-timer"
     )
 
@@ -312,28 +314,30 @@ async def _election_timeout_coro(timeout: float) -> None:
         await asyncio.sleep(timeout)
     except asyncio.CancelledError:
         return
-    # Timeout fired — start election (acquire lock outside to avoid deadlock if
-    # cancel arrived between sleep and here).
     async with _raft_lock:
         if _role != "leader":
             _start_election()
+    await _save_raft_state()  # outside lock
 
 # ---------------------------------------------------------------------------
 # Role transitions  (caller holds _raft_lock)
 # ---------------------------------------------------------------------------
 
-def _step_down(new_term: int, new_leader: str | None = None) -> None:
+def _step_down(new_term: int, new_leader: str | None = None) -> bool:
+    """Update in-memory state only.  Returns True if term changed (caller must
+    await _save_raft_state() after releasing _raft_lock)."""
     global _current_term, _voted_for, _role, _leader, _next_index, _match_index
-    if new_term > _current_term:
+    need_persist = new_term > _current_term
+    if need_persist:
         _current_term = new_term
         _voted_for    = None
         _next_index   = {}
         _match_index  = {}
-        _save_raft_state()
     _role   = "follower"
     _leader = new_leader
     _reset_election_timer()
     log.info("step_down term=%d leader=%s", _current_term, new_leader)
+    return need_persist
 
 
 def _become_leader() -> None:
@@ -348,13 +352,13 @@ def _become_leader() -> None:
 
 
 def _start_election() -> None:
-    """Begin a new election term.  Caller holds _raft_lock."""
+    """Update in-memory state and fire the election task.  Caller holds
+    _raft_lock and must await _save_raft_state() after releasing it."""
     global _current_term, _voted_for, _role, _leader
     _current_term += 1
     _role         = "candidate"
     _voted_for    = SELF_ADDR
     _leader       = None
-    _save_raft_state()
     _reset_election_timer()
     log.info("election started term=%d", _current_term)
     asyncio.create_task(
@@ -442,19 +446,26 @@ async def _run_election(term: int, peers: list[str],
             except Exception:
                 continue
 
+            action = None
             async with _raft_lock:
                 if _role != "candidate" or _current_term != term:
                     return
                 if peer_term > _current_term:
                     _step_down(peer_term)
-                    return
-                if granted:
+                    action = "step_down"
+                elif granted:
                     votes.add(peer)
                     log.info("vote from %s term=%d votes=%d/%d",
                              peer, term, len(votes), quorum)
                     if len(votes) >= quorum:
                         _become_leader()
-                        return
+                        action = "became_leader"
+
+            if action == "step_down":
+                await _save_raft_state()
+                return
+            if action == "became_leader":
+                return
     finally:
         for t in tasks:
             t.cancel()
@@ -474,9 +485,12 @@ async def _fire_heartbeat(peer: str, term: int, prev_idx: int, prev_trm: int,
                           entries: list, commit: int) -> None:
     _, peer_term = await _rpc_append_entries(peer, term, prev_idx, prev_trm, entries, commit)
     if peer_term > term:
+        save = False
         async with _raft_lock:
             if peer_term > _current_term:
-                _step_down(peer_term)
+                save = _step_down(peer_term)
+        if save:
+            await _save_raft_state()
 
 
 async def _heartbeat_round(term: int) -> tuple[int, int]:
@@ -540,18 +554,21 @@ async def _heartbeat_loop() -> None:
             log.exception("heartbeat_round raised")
             ack_count, max_term = 0, 0
 
+        save = False
         async with _raft_lock:
             if _role != "leader" or _current_term != term:
                 continue
             if max_term > _current_term:
-                _step_down(max_term)
-                continue
-            cluster_size = len(PEERS) + 1
-            quorum       = cluster_size // 2 + 1
-            if ack_count < quorum:
-                log.info("quorum lost (%d/%d) term=%d — stepping down",
-                         ack_count, quorum, _current_term)
-                _step_down(_current_term)
+                save = _step_down(max_term)
+            else:
+                cluster_size = len(PEERS) + 1
+                quorum       = cluster_size // 2 + 1
+                if ack_count < quorum:
+                    log.info("quorum lost (%d/%d) term=%d — stepping down",
+                             ack_count, quorum, _current_term)
+                    _step_down(_current_term)
+        if save:
+            await _save_raft_state()
 
 # ---------------------------------------------------------------------------
 # Write actor
@@ -562,6 +579,7 @@ async def _heartbeat_loop() -> None:
 # ---------------------------------------------------------------------------
 
 _write_queue: asyncio.Queue  # initialised in on_startup
+_STOP = object()             # sentinel: tells _write_worker to exit cleanly
 
 
 async def _write_worker() -> None:
@@ -569,31 +587,39 @@ async def _write_worker() -> None:
     global _commit_index
     while True:
         first = await _write_queue.get()
+        if first is _STOP:
+            return
         batch = [first]
         while not _write_queue.empty():
             try:
-                batch.append(_write_queue.get_nowait())
+                item = _write_queue.get_nowait()
             except asyncio.QueueEmpty:
                 break
+            if item is _STOP:
+                _write_queue.put_nowait(_STOP)  # re-queue so outer loop sees it
+                break
+            batch.append(item)
 
         entries = []
-        async with _raft_lock:
-            for command, _ in batch:
-                idx, entry = _log_append_mem(_current_term, command)
-                _commit_index = idx
-                entries.append(entry)
-            _apply_committed_entries()
-
+        try:
+            async with _raft_lock:
+                for command, _ in batch:
+                    idx, entry = _log_append_mem(_current_term, command)
+                    _commit_index = idx
+                    entries.append(entry)
+                _apply_committed_entries()
+                if DATA_DIR:
+                    for entry in entries:
+                        _write_log_line(entry)
+            # Lock released before fsync — Raft RPCs and elections proceed freely.
             if DATA_DIR:
-                for entry in entries:
-                    _write_log_line(entry)
-                # fsync in thread pool — suspends this task but holds the lock,
-                # so conflicting Raft mutations wait until fsync completes.
                 await loop.run_in_executor(None, _do_fsync)
-
-        for _, future in batch:
-            if not future.done():
-                future.set_result(None)
+        finally:
+            # Always resolve futures so HTTP handlers get a response, even on
+            # cancellation.  _checkpoint() in on_shutdown ensures durability.
+            for _, future in batch:
+                if not future.done():
+                    future.set_result(None)
 
 
 async def _leader_write(command: dict) -> None:
@@ -687,6 +713,10 @@ async def handle_request_vote(request: web.Request) -> web.Response:
     cand_lli  = body.get("last-log-index", 0)
     cand_llt  = body.get("last-log-term",  0)
 
+    grant      = False
+    need_save  = False
+    resp_term  = 0
+
     async with _raft_lock:
         # Disruptive-server prevention (Raft §6)
         if (cand_term > _current_term
@@ -699,7 +729,7 @@ async def handle_request_vote(request: web.Request) -> web.Response:
             )
 
         if cand_term > _current_term:
-            _step_down(cand_term)
+            need_save = _step_down(cand_term)
 
         my_lli = _log_last_index()
         my_llt = _log_last_term()
@@ -712,14 +742,21 @@ async def handle_request_vote(request: web.Request) -> web.Response:
         )
         if grant:
             _voted_for = cand_id
-            _save_raft_state()
             _reset_election_timer()
             log.info("voted for %s term=%d", cand_id, _current_term)
+            need_save = True
 
-        return web.Response(
-            text=json.dumps({"term": _current_term, "vote-granted": grant}),
-            content_type="application/json",
-        )
+        resp_term = _current_term
+
+    # Fsync outside the lock — lock not held during disk I/O.
+    # Must complete before we respond (Raft safety: don't ack a vote we haven't persisted).
+    if need_save:
+        await _save_raft_state()
+
+    return web.Response(
+        text=json.dumps({"term": resp_term, "vote-granted": grant}),
+        content_type="application/json",
+    )
 
 
 async def handle_append_entries(request: web.Request) -> web.Response:
@@ -733,6 +770,10 @@ async def handle_append_entries(request: web.Request) -> web.Response:
     entries       = body.get("entries", [])
     leader_commit = body.get("leader-commit", 0)
 
+    need_save = False
+    success   = False
+    resp_term = 0
+
     async with _raft_lock:
         if leader_term < _current_term:
             return web.Response(
@@ -741,7 +782,7 @@ async def handle_append_entries(request: web.Request) -> web.Response:
             )
 
         if leader_term > _current_term:
-            _step_down(leader_term, leader_id)
+            need_save = _step_down(leader_term, leader_id)
         else:
             if _role == "candidate":
                 log.info("candidate yielding to leader %s term=%d", leader_id, leader_term)
@@ -750,33 +791,36 @@ async def handle_append_entries(request: web.Request) -> web.Response:
             _reset_election_timer()
 
         _leader_last_contact = time.monotonic()
+        resp_term = _current_term
 
         if prev_log_idx > 0 and _log_term_at(prev_log_idx) != prev_log_trm:
-            return web.Response(
-                text=json.dumps({"term": _current_term, "success": False}),
-                content_type="application/json",
-            )
-
-        for i, entry in enumerate(entries):
-            slot = prev_log_idx + 1 + i
-            if slot <= _log_last_index():
-                if _log_term_at(slot) != entry["term"]:
-                    _log_truncate_after(slot - 1)
+            pass  # success stays False; still need to persist term if it changed
+        else:
+            for i, entry in enumerate(entries):
+                slot = prev_log_idx + 1 + i
+                if slot <= _log_last_index():
+                    if _log_term_at(slot) != entry["term"]:
+                        _log_truncate_after(slot - 1)
+                        _raft_log.append(entry)
+                else:
                     _raft_log.append(entry)
-            else:
-                _raft_log.append(entry)
 
-        if entries:
-            _rewrite_log_file()  # rare; blocks event loop briefly
+            if entries:
+                _rewrite_log_file()  # rare; blocks event loop briefly
 
-        if leader_commit > _commit_index:
-            _commit_index = min(leader_commit, _log_last_index())
-            _apply_committed_entries()
+            if leader_commit > _commit_index:
+                _commit_index = min(leader_commit, _log_last_index())
+                _apply_committed_entries()
 
-        return web.Response(
-            text=json.dumps({"term": _current_term, "success": True}),
-            content_type="application/json",
-        )
+            success = True
+
+    if need_save:
+        await _save_raft_state()
+
+    return web.Response(
+        text=json.dumps({"term": resp_term, "success": success}),
+        content_type="application/json",
+    )
 
 # ---------------------------------------------------------------------------
 # App lifecycle
@@ -803,26 +847,39 @@ async def on_startup(app: web.Application) -> None:
 
     log.info("starting node=%s peers=%s", SELF_ADDR, PEERS)
 
+    need_save = False
     async with _raft_lock:
         if not PEERS:
             _current_term += 1
             _voted_for     = SELF_ADDR
-            _save_raft_state()
             _become_leader()
+            need_save = True
         else:
             _reset_election_timer()
+    if need_save:
+        await _save_raft_state()
 
 
 async def on_shutdown(app: web.Application) -> None:
     _cancel_election_timer()
-    for key in ("write_worker", "heartbeat"):
-        task = app.get(key)
-        if task:
-            task.cancel()
-            try:
-                await task
-            except asyncio.CancelledError:
-                pass
+
+    # Drain the write queue: send sentinel and wait for the worker to process
+    # all preceding items and exit.  In-flight HTTP writes get their response
+    # before the server closes connections.
+    await _write_queue.put(_STOP)
+    write_worker = app.get("write_worker")
+    if write_worker:
+        try:
+            await asyncio.wait_for(write_worker, timeout=10.0)
+        except (asyncio.TimeoutError, asyncio.CancelledError):
+            write_worker.cancel()
+            await asyncio.gather(write_worker, return_exceptions=True)
+
+    heartbeat = app.get("heartbeat")
+    if heartbeat:
+        heartbeat.cancel()
+        await asyncio.gather(heartbeat, return_exceptions=True)
+
     await _checkpoint()
     await _http_session.close()
 
