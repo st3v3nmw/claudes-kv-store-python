@@ -26,8 +26,8 @@ Write path:
 
 Raft timing:
   Election timeout : 500–1000 ms (randomised)
-  Heartbeat        : 50 ms
-  RPC timeout      : 70 ms (heartbeat), 350 ms (vote)
+  Heartbeat        : 100 ms
+  RPC timeout      : 150 ms (heartbeat), 400 ms (vote)
 """
 
 import asyncio
@@ -58,10 +58,10 @@ ADDR:     str       = os.environ.get("ADDR", "")
 
 ELECTION_TIMEOUT_MIN  = 0.5    # seconds
 ELECTION_TIMEOUT_MAX  = 1.0
-HEARTBEAT_INTERVAL    = 0.05   # seconds
-HEARTBEAT_RPC_TIMEOUT = 0.07   # seconds
-VOTE_RPC_TIMEOUT      = 0.35   # seconds
-LEADER_STALE_THRESHOLD = 0.3   # seconds
+HEARTBEAT_INTERVAL    = 0.1    # seconds — 1/5 of election timeout min
+HEARTBEAT_RPC_TIMEOUT = 0.15   # seconds
+VOTE_RPC_TIMEOUT      = 0.4    # seconds — must complete within election timeout min
+LEADER_STALE_THRESHOLD = 0.3   # seconds — 3x heartbeat, << election timeout min
 
 RAFT_STATE_FILE = "raft_state.json"
 RAFT_LOG_FILE   = "raft_log.jsonl"
