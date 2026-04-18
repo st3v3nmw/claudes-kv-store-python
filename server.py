@@ -59,10 +59,10 @@ ADDR:     str       = os.environ.get("ADDR", "")
 ELECTION_TIMEOUT_MIN  = 0.5    # seconds
 ELECTION_TIMEOUT_MAX  = 1.0
 HEARTBEAT_INTERVAL    = 0.1    # seconds — 1/5 of election timeout min
-HEARTBEAT_RPC_TIMEOUT = 0.2    # seconds — generous but well below election timeout
+HEARTBEAT_RPC_TIMEOUT = 0.1    # seconds — well below election timeout; reachable peers respond in <10ms
 VOTE_RPC_TIMEOUT      = 0.4    # seconds — must complete within election timeout min
 LEADER_STALE_THRESHOLD = 0.3   # seconds — 3x heartbeat, << election timeout min
-HEARTBEAT_MISS_LIMIT  = 3      # consecutive missed rounds before leader steps down
+HEARTBEAT_MISS_LIMIT  = 2      # consecutive missed rounds before leader steps down
 
 RAFT_STATE_FILE = "raft_state.json"
 RAFT_LOG_FILE   = "raft_log.jsonl"
@@ -117,7 +117,6 @@ _next_index:  dict[str, int] = {}
 _match_index: dict[str, int] = {}
 
 _election_task: asyncio.Task | None = None
-_leader_since: float = 0.0   # monotonic time of most recent _become_leader()
 
 # ---------------------------------------------------------------------------
 # Log helpers  (caller holds _raft_lock)
@@ -343,12 +342,11 @@ def _step_down(new_term: int, new_leader: str | None = None) -> bool:
 
 
 def _become_leader() -> None:
-    global _role, _leader, _next_index, _match_index, _leader_since
-    _role         = "leader"
-    _leader       = SELF_ADDR
-    _next_index   = {p: _log_last_index() + 1 for p in PEERS}
-    _match_index  = {p: 0 for p in PEERS}
-    _leader_since = time.monotonic()
+    global _role, _leader, _next_index, _match_index
+    _role        = "leader"
+    _leader      = SELF_ADDR
+    _next_index  = {p: _log_last_index() + 1 for p in PEERS}
+    _match_index = {p: 0 for p in PEERS}
     _cancel_election_timer()
     log.info("became leader term=%d", _current_term)
     asyncio.create_task(_broadcast_initial_heartbeat(), name="initial-heartbeat")
@@ -497,30 +495,25 @@ async def _fire_heartbeat(peer: str, term: int, prev_idx: int, prev_trm: int,
 
 
 async def _heartbeat_round(term: int) -> tuple[int, int]:
+    """Returns (ack_count, max_term).
+
+    Heartbeats use prev-log-index=0 as specified for this stage, so followers
+    always return success=True when reachable.  ack_count therefore equals the
+    number of reachable peers (self + responding followers).
+    """
     peers = list(PEERS)
     if not peers:
         return 1, 0
 
-    cluster_size = len(peers) + 1
-    quorum       = cluster_size // 2 + 1
-    ack_count    = 1
-    max_term     = 0
+    ack_count = 1  # self
+    max_term  = 0
 
     async with _raft_lock:
-        commit    = _commit_index
-        peer_args = {
-            p: (
-                _next_index.get(p, _log_last_index() + 1) - 1,
-                _log_term_at(_next_index.get(p, _log_last_index() + 1) - 1),
-                [],
-                commit,
-            )
-            for p in peers
-        }
+        commit = _commit_index
 
     tasks = [
-        asyncio.create_task(_rpc_append_entries(p, term, *args))
-        for p, args in peer_args.items()
+        asyncio.create_task(_rpc_append_entries(p, term, 0, 0, [], commit))
+        for p in peers
     ]
     # Always wait for ALL peers — breaking early cancels outstanding RPCs and
     # deprives slow followers of heartbeats, causing spurious elections.
@@ -566,23 +559,14 @@ async def _heartbeat_loop() -> None:
                 cluster_size = len(PEERS) + 1
                 quorum       = cluster_size // 2 + 1
                 if ack_count < quorum:
-                    # Suppress quorum-miss counting for one full election-timeout
-                    # window after winning an election.  At partition onset the
-                    # network layer briefly disrupts even reachable peers while
-                    # iptables rules are applied; stepping down immediately causes
-                    # term-increment churn that prevents the majority side from
-                    # stabilising a leader.  After the grace period, genuine
-                    # quorum loss is still detected via consecutive_misses.
-                    in_grace = (time.monotonic() - _leader_since) < ELECTION_TIMEOUT_MIN
-                    if not in_grace:
-                        consecutive_misses += 1
-                        log.info("quorum miss %d/%d (%d/%d acks) term=%d",
-                                 consecutive_misses, HEARTBEAT_MISS_LIMIT,
-                                 ack_count, quorum, _current_term)
-                        if consecutive_misses >= HEARTBEAT_MISS_LIMIT:
-                            log.info("quorum lost — stepping down term=%d", _current_term)
-                            _step_down(_current_term)
-                            consecutive_misses = 0
+                    consecutive_misses += 1
+                    log.info("quorum miss %d/%d (%d/%d acks) term=%d",
+                             consecutive_misses, HEARTBEAT_MISS_LIMIT,
+                             ack_count, quorum, _current_term)
+                    if consecutive_misses >= HEARTBEAT_MISS_LIMIT:
+                        log.info("quorum lost — stepping down term=%d", _current_term)
+                        _step_down(_current_term)
+                        consecutive_misses = 0
                 else:
                     consecutive_misses = 0
         if save:
