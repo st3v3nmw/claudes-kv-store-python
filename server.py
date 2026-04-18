@@ -41,11 +41,27 @@ import time
 import aiohttp
 from aiohttp import web
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s %(levelname)s [raft] %(message)s",
-    datefmt="%H:%M:%S",
-)
+def _node_label(addr: str) -> str:
+    """Map 10.0.42.1NN:port → nN for harness addresses, else return addr."""
+    try:
+        octet = int(addr.split(":")[0].split(".")[-1])
+        if 101 <= octet <= 199:
+            return f"n{octet - 100}"
+    except (ValueError, IndexError):
+        pass
+    return addr or "local"
+
+
+class _Formatter(logging.Formatter):
+    """Wall-clock with ms precision + relative time since process start."""
+    def formatTime(self, record, datefmt=None):
+        ct = self.converter(record.created)
+        return f"{time.strftime('%H:%M:%S', ct)}.{int(record.msecs):03d}"
+
+
+_handler = logging.StreamHandler()
+logging.getLogger().setLevel(logging.INFO)
+logging.getLogger().addHandler(_handler)
 log = logging.getLogger("raft")
 
 # ---------------------------------------------------------------------------
@@ -55,6 +71,12 @@ log = logging.getLogger("raft")
 DATA_DIR: str       = os.environ.get("DATA_DIR", "")
 PEERS:    list[str] = [p.strip() for p in os.environ.get("PEERS", "").split(",") if p.strip()]
 ADDR:     str       = os.environ.get("ADDR", "")
+
+_NAMES: dict[str, str] = {a: _node_label(a) for a in ([ADDR] + PEERS) if a}
+
+def _nn(addr: str) -> str:
+    """Resolve addr to a short node label for log output."""
+    return _NAMES.get(addr, addr)
 
 ELECTION_TIMEOUT_MIN  = 0.5    # seconds
 ELECTION_TIMEOUT_MAX  = 1.0
@@ -90,6 +112,10 @@ def _detect_self_addr() -> str:
         return "127.0.0.1:8080"
 
 SELF_ADDR: str = _detect_self_addr()
+_NAMES[SELF_ADDR] = _node_label(SELF_ADDR)
+_handler.setFormatter(_Formatter(
+    f"%(asctime)s +%(relativeCreated)dms [{_node_label(SELF_ADDR)}] %(message)s"
+))
 
 # ---------------------------------------------------------------------------
 # In-memory state
@@ -337,7 +363,7 @@ def _step_down(new_term: int, new_leader: str | None = None) -> bool:
     _role   = "follower"
     _leader = new_leader
     _reset_election_timer()
-    log.info("step_down term=%d leader=%s", _current_term, new_leader)
+    log.info("step_down term=%d leader=%s", _current_term, _nn(new_leader) if new_leader else None)
     return need_persist
 
 
@@ -457,7 +483,7 @@ async def _run_election(term: int, peers: list[str],
                 elif granted:
                     votes.add(peer)
                     log.info("vote from %s term=%d votes=%d/%d",
-                             peer, term, len(votes), quorum)
+                             _nn(peer), term, len(votes), quorum)
                     if len(votes) >= quorum:
                         _become_leader()
                         action = "became_leader"
@@ -745,7 +771,7 @@ async def handle_request_vote(request: web.Request) -> web.Response:
         if grant:
             _voted_for = cand_id
             _reset_election_timer()
-            log.info("voted for %s term=%d", cand_id, _current_term)
+            log.info("voted for %s term=%d", _nn(cand_id), _current_term)
             need_save = True
 
         resp_term = _current_term
@@ -787,7 +813,7 @@ async def handle_append_entries(request: web.Request) -> web.Response:
             need_save = _step_down(leader_term, leader_id)
         else:
             if _role == "candidate":
-                log.info("candidate yielding to leader %s term=%d", leader_id, leader_term)
+                log.info("candidate yielding to leader %s term=%d", _nn(leader_id), leader_term)
                 _role = "follower"
             _leader = leader_id
             _reset_election_timer()
@@ -847,7 +873,7 @@ async def on_startup(app: web.Application) -> None:
     app["write_worker"] = asyncio.create_task(_write_worker(),   name="write-worker")
     app["heartbeat"]    = asyncio.create_task(_heartbeat_loop(), name="heartbeat")
 
-    log.info("starting node=%s peers=%s", SELF_ADDR, PEERS)
+    log.info("starting peers=%s", [_nn(p) for p in PEERS])
 
     need_save = False
     async with _raft_lock:
