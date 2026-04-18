@@ -52,13 +52,6 @@ def _node_label(addr: str) -> str:
     return addr or "local"
 
 
-class _Formatter(logging.Formatter):
-    """Wall-clock with ms precision + relative time since process start."""
-    def formatTime(self, record, datefmt=None):
-        ct = self.converter(record.created)
-        return f"{time.strftime('%H:%M:%S', ct)}.{int(record.msecs):03d}"
-
-
 _handler = logging.StreamHandler()
 logging.getLogger().setLevel(logging.INFO)
 logging.getLogger().addHandler(_handler)
@@ -113,9 +106,7 @@ def _detect_self_addr() -> str:
 
 SELF_ADDR: str = _detect_self_addr()
 _NAMES[SELF_ADDR] = _node_label(SELF_ADDR)
-_handler.setFormatter(_Formatter(
-    f"%(asctime)s +%(relativeCreated)dms [{_node_label(SELF_ADDR)}] %(message)s"
-))
+_handler.setFormatter(logging.Formatter("%(message)s"))
 
 # ---------------------------------------------------------------------------
 # In-memory state

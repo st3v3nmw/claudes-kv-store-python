@@ -1,2 +1,2 @@
 challenge: kv-store
-stage: leader-election
+stage: log-replication
