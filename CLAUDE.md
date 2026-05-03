@@ -19,5 +19,5 @@ Start by initialising the challenge in your working directory, then read the sta
   ```
 - Design your architecture with future evolution in mind.
 - Read each stage spec carefully before writing code. The tests are strict on HTTP contracts, status codes, and error messages.
-- When tests fail, read the test harness output carefully — it tells you what went wrong. Your server's stdout/stderr is available via `clstr logs <node>`.
+- When tests fail, read the test harness output carefully — it tells you what went wrong. Your server's stdout/stderr is available via `clstr logs`.
 - Add a GitHub Actions workflow that runs `clstr test` on every push (https://clstr.io/guides/cli/).

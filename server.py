@@ -677,7 +677,7 @@ async def handle_kv(request: web.Request) -> web.Response:
         if not value:
             return web.Response(text="value cannot be empty", status=400)
         await _leader_write({"op": "put", "key": key, "value": value})
-        return web.Response(status=200)
+        return web.Response(text="", status=200)
 
     if request.method == "GET":
         value = store.get(key)
@@ -687,7 +687,7 @@ async def handle_kv(request: web.Request) -> web.Response:
 
     if request.method == "DELETE":
         await _leader_write({"op": "delete", "key": key})
-        return web.Response(status=200)
+        return web.Response(text="", status=200)
 
     return web.Response(text="method not allowed", status=405)
 
@@ -699,7 +699,7 @@ async def handle_clear(request: web.Request) -> web.Response:
     if redir is not None:
         return redir
     await _leader_write({"op": "clear"})
-    return web.Response(status=200)
+    return web.Response(text="", status=200)
 
 
 async def handle_health(_: web.Request) -> web.Response:
